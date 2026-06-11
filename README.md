@@ -1,1 +1,1 @@
-Vynacode weaves together your codebase, local AI models, and developer intent into working software.
+Vynacode weaves together your codebase and local AI models at compact VRAM constraints.

@@ -1,0 +1,16 @@
+[project]
+name = "vynacode"
+version = "0.1.0"
+description = "Vynacode weaves together your codebase, local AI models, and developer intent into working software."
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "nuitka>=4.1.2",
+]

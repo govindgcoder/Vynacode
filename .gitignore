@@ -2,10 +2,8 @@ __pycache__/
 *.py[cod]
 
 .venv/
-
+vynacode/
 build/
 dist/
-
-LICENSE_COMMERCIAL
 
 .python-version

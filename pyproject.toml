@@ -1,7 +1,7 @@
 [project]
 name = "vynacode"
 version = "0.1.0"
-description = "Vynacode weaves together your codebase, local AI models, and developer intent into working software."
+description = "Vynacode weaves together your codebase and local AI models at compact VRAM constraints."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = []
@@ -14,3 +14,9 @@ build-backend = "hatchling.build"
 dev = [
     "nuitka>=4.1.2",
 ]
+
+[project.scripts]
+vynacode = "vynacode.cli:app"
+
+[project.license]
+text = "AGPL-3.0-only OR Commercial"

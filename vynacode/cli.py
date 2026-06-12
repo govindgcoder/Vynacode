@@ -29,9 +29,6 @@ def run(
     pass
 
 
-#           show plan, show context, show index, revert, log, models, doctor, activate <key>, tier
-
-
 @app.command()
 def show(option: str = "plan"):
     if option == "plan":

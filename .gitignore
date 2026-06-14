@@ -5,4 +5,6 @@ __pycache__/
 build/
 dist/
 
+.vynarc
+
 .python-version

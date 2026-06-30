@@ -22,12 +22,13 @@ class Block(BaseModel):
 
 
 class FileMetadata(BaseModel):
+    name: str
     path: Path
     language: str
     size_bytes: int = Field(..., ge=0)
     hash: str
-    imports: List[str]
-    blocks: List[Block]
+    imports: List[str] = Field(default_factory=list)
+    blocks: List[Block] = Field(default_factory=list)
 
 
 # to prevent any negative value ge is used

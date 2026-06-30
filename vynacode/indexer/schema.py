@@ -6,19 +6,29 @@ from pydantic import BaseModel, Field, RootModel
 
 
 class Parameter(BaseModel):
-    name: str
-    type: str
+    name: Optional[str] = None
+    type: Optional[str] = None
 
 
 class Block(BaseModel):
     id: str
-    name: str
-    type: str
-    params: List[Parameter]
-    returns: str
-    line_range: Tuple[int, int]
-    dependencies: List[str]
-    summary: str
+    name: Optional[str] = None
+    type: Optional[str] = None
+    params: Optional[List[Parameter]] = None
+    returns: Optional[str] = None
+    line_range: Optional[Tuple[int, int]] = None
+    dependencies: Optional[List[str]] = None
+    summary: Optional[str] = None
+    byte_start: int
+    byte_end: int
+    parent_id: Optional[str] = None
+    is_async: bool = False
+    chunk_boundary: bool = False
+
+    @computed_field
+    @property
+    def token_estimate(self) -> int:
+        return (self.byte_end - self.byte_start) // 3
 
 
 class FileMetadata(BaseModel):

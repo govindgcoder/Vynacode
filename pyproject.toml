@@ -4,7 +4,10 @@ version = "0.1.0"
 description = "Vynacode weaves together your codebase and local AI models at compact VRAM constraints."
 readme = "README.md"
 requires-python = ">=3.12"
-dependencies = []
+dependencies = [
+    "tree-sitter>=0.26.0",
+    "tree-sitter-python>=0.25.0",
+]
 
 [build-system]
 requires = ["hatchling"]

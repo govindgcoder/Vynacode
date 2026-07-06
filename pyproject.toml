@@ -5,6 +5,9 @@ description = "Vynacode weaves together your codebase and local AI models at com
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
+    "asyncio>=4.0.0",
+    "ollama>=0.6.2",
+    "requests>=2.34.2",
     "tree-sitter>=0.26.0",
     "tree-sitter-python>=0.25.0",
 ]

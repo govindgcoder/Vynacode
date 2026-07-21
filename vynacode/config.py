@@ -21,6 +21,7 @@ PLANNER_MODEL = config_data.get("planner_model", "gemma4:e4b")
 CODER_MODEL = config_data.get("coder_model", "qwen2.5-coder:7b")
 CONTEXT_WINDOW = config_data.get("context_window", 8192)
 TIER = config_data.get("tier", "free")
+TOKEN_BUDGET = config_data.get("token_budget", 2048)
 
 
 def get_setting(key, default=None):

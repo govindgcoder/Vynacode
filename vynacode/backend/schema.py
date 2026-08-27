@@ -2,7 +2,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from pydantic import BaseModel, Field, RootModel
+from pydantic import BaseModel, Field, RootModel, computed_field
 
 
 class Parameter(BaseModel):
@@ -22,6 +22,7 @@ class Block(BaseModel):
     byte_start: int
     byte_end: int
     parent_id: Optional[str] = None
+    parent_file: Optional[str] = None
     is_async: bool = False
     chunk_boundary: bool = False
 
@@ -31,7 +32,7 @@ class Block(BaseModel):
         return (self.byte_end - self.byte_start) // 3
 
 
-class FileMetadata(BaseModel):
+class FileMetaData(BaseModel):
     name: str
     path: Path
     language: str

@@ -1,15 +1,17 @@
 import sqlite3
-import re
-import json
 from pathlib import Path
-from typing import List
+from typing import Dict, List
 
-from schema import Block 
+from pydantic import BaseModel
+
+from schema import Block
 from client import OllamaClient
-
-import sys
-sys.path.append('../')
 from config import PLANNER_MODEL, TOKEN_BUDGET
+
+
+class BlockSummaries(BaseModel):
+    summaries: Dict[str, str]
+
 
 async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Block], source_code: bytes):
     current_batch: List[Block] = []
@@ -30,23 +32,24 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
                 code_xml += f'<block id="{block.id}">\n{code_string}\n</block>\n'
 
             prompt = (
-                "Summarize the functionality of the following code blocks, in less than 40 words each. "
-                "Output your summaries in JSON format: {\"id1\": \"summary1\", \"id2\": \"summary2\"}. "
-                "Ensure output is ONLY the JSON object. No other text.\n\n"
+                "Summarize the functionality of each code block in less than 40 words. "
+                "Return a JSON object with a single key \"summaries\" whose value is an object "
+                "mapping each block id to its summary. Use the exact block ids provided. "
+                "Output ONLY the JSON object, no other text.\n\n"
                 f"CODE BLOCKS:\n{code_xml}"
             )
-            output = await llm.complete(PLANNER_MODEL, "user", prompt)
-            output = output.strip()
-            output = re.sub(r"^```(?:json)?\s*", "", output)
-            output = re.sub(r"\s*```$", "", output)
+            output = await llm.complete(
+                PLANNER_MODEL, "user", prompt, format=BlockSummaries.model_json_schema()
+            )
             try:
-                output_json = json.loads(output)
+                parsed = BlockSummaries.model_validate_json(output)
             except Exception as e:
                 print(f"Error parsing JSON: {e}")
+                print("Raw output:", output)
                 return
 
             for block in current_batch:
-                summary = output_json.get(block.id)
+                summary = parsed.summaries.get(block.id)
                 if summary:
                     update_data.append((summary, block.id))
 
@@ -54,6 +57,5 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
             current_tokens = 0
 
     if update_data:
-        with sqlite3.connect(db_path) as conn:  
+        with sqlite3.connect(db_path) as conn:
             conn.executemany("UPDATE blocks SET summary = ? WHERE id = ?", update_data)
-

@@ -1,27 +1,42 @@
 # SPDX-License-Identifier: AGPL-3.0-only OR Commercial
+import asyncio
+import sys
+from pathlib import Path
+
+_ROOT = Path(__file__).resolve().parent
+sys.path.insert(0, str(_ROOT / "backend"))
+sys.path.insert(0, str(_ROOT))
+
 import typer
+from database import init_db, upsert_file_metadata, upsert_block, write_codebase_json
+from walker import walk
+from parser import parse_python_file
+from client import OllamaClient
+from summarizer import summarize_and_store
 
 app = typer.Typer()
 
+llm = OllamaClient()
 
 @app.command()
-def setup():
-    print("Setup! to be implemented")
-    pass
+def index(path: str):
+    dir_path = Path(path).resolve()
+    db_path = dir_path / ".vc" / "vcdb.db"
+    db_path.parent.mkdir(parents=True, exist_ok=True)
+    init_db(db_path)
 
+    async def _run_pipeline():
+        for file_metadata in walk(dir_path):
+            upsert_file_metadata(db_path, file_metadata)
+            if file_metadata.language == ".py":
+                blocks = parse_python_file(file_metadata.path)
+                upsert_block(db_path, str(file_metadata.path), blocks)
+                with open(file_metadata.path, "rb") as f:
+                    file_bytes = f.read()
+                await summarize_and_store(llm, db_path, blocks, file_bytes)
+        write_codebase_json(db_path, dir_path / "codebase.json")
 
-@app.command()
-def index(path):
-    # for files in walk(path)
-    #   create filemetadata object
-    #   call parse python file if .py or skip with only start and end bytes
-    #   add the blocks to the filemetadata
-    #   upsert it to the database
-    #   call summarizer for the blocks
-    # write the sql query results to codebase.json and only the one liner summaries start and end bytes to the codebase.md file
-    # query: SELECT files.path, blocks.name, blocks.summary FROM files JOIN blocks ON files.path = blocks.parent_file
-    # 
-    pass
+    asyncio.run(_run_pipeline())
 
 @app.command()
 def run(
@@ -50,12 +65,6 @@ def show(option: str = "plan"):
 
 
 @app.command()
-def revert():
-    print("Revert! to be implemented")
-    pass
-
-
-@app.command()
 def log():
     print("Log! to be implemented")
     pass
@@ -70,18 +79,6 @@ def models():
 @app.command()
 def doctor():
     print("Doctor! to be implemented")
-    pass
-
-
-@app.command()
-def activate(key):
-    print(f"Activating {key} to be implemented")
-    pass
-
-
-@app.command()
-def tier():
-    print("Tier: .... [to be implemented]")
     pass
 
 

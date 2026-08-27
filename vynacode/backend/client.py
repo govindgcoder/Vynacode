@@ -4,9 +4,9 @@ import httpx
 
 
 class OllamaClient:
-    def __init__(self, base_url: str = "http://localhost:11434"):
+    def __init__(self, base_url: str = "http://localhost:11434", timeout: float = 300.0):
         self.base_url = base_url
-        self._client = httpx.AsyncClient()
+        self._client = httpx.AsyncClient(timeout=timeout)
 
     async def ping(self):
         try:
@@ -15,23 +15,29 @@ class OllamaClient:
         except httpx.ConnectError:
             return False
 
-    async def complete(self, model: str, role: str, prompt: str):
+    async def complete(self, model: str, role: str, prompt: str, think: bool = False, format=None):
         payload = {
             "model": model,
             "messages": [{"role": role, "content": prompt}],
             "stream": False,
+            "think": think,
         }
+        if format is not None:
+            payload["format"] = format
         response = await self._client.post(f"{self.base_url}/api/chat", json=payload)
         response.raise_for_status()
         data = response.json()
         return data["message"]["content"]
 
-    async def stream(self, model: str, role: str, prompt: str):
+    async def stream(self, model: str, role: str, prompt: str, think: bool = False, format=None):
         payload = {
             "model": model,
             "messages": [{"role": role, "content": prompt}],
             "stream": True,
+            "think": think,
         }
+        if format is not None:
+            payload["format"] = format
 
         async with self._client.stream(
             "POST", f"{self.base_url}/api/chat", json=payload

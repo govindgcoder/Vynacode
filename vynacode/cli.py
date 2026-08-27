@@ -12,9 +12,16 @@ def setup():
 
 @app.command()
 def index(path):
-    print(f"Indexing path {path}. to be implemented")
+    # for files in walk(path)
+    #   create filemetadata object
+    #   call parse python file if .py or skip with only start and end bytes
+    #   add the blocks to the filemetadata
+    #   upsert it to the database
+    #   call summarizer for the blocks
+    # write the sql query results to codebase.json and only the one liner summaries start and end bytes to the codebase.md file
+    # query: SELECT files.path, blocks.name, blocks.summary FROM files JOIN blocks ON files.path = blocks.parent_file
+    # 
     pass
-
 
 @app.command()
 def run(

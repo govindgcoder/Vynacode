@@ -36,7 +36,6 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
                 f"CODE BLOCKS:\n{code_xml}"
             )
             output = await llm.complete(PLANNER_MODEL, "user", prompt)
-
             output = output.strip()
             output = re.sub(r"^```(?:json)?\s*", "", output)
             output = re.sub(r"\s*```$", "", output)

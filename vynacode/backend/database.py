@@ -175,15 +175,17 @@ def upsert_block(db_path: Path, parent_file: str, blocks: List[Block]):
 def write_codebase_json(db_path: Path, codebase_json: Path):
     with sqlite3.connect(str(db_path)) as con:
         rows = con.execute(
-            "SELECT files.path, blocks.name, blocks.summary "
+            "SELECT files.path, blocks.name, blocks.summary, blocks.line_range_start, blocks.line_range_end "
             "FROM files "
             "INNER JOIN blocks ON files.path = blocks.parent_file "
             "ORDER BY files.path, blocks.line_range_start"
         ).fetchall()
         codebase_data = defaultdict(list)
-        for file_path, block_name, summary in rows:
+        for file_path, block_name, summary, line_range_start, line_range_end in rows:
             codebase_data[file_path].append({
                 "name": block_name,
+                "line_start": line_range_start,
+                "line_end": line_range_end,
                 "summary": summary
             })
         with open(codebase_json, "w", encoding="utf-8") as f:

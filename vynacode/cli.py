@@ -51,6 +51,7 @@ async def _llm_json_with_retry(model: str, prompt: str, validator, max_retries: 
         except Exception as e:
             console.print(f"[red]LLM call failed (attempt {attempt + 1}/{max_retries}): {e}[/red]")
             if attempt < max_retries - 1:
+                console.print("[yellow]Retrying...[/yellow]")
                 await asyncio.sleep(1)
                 continue
             return None
@@ -59,10 +60,12 @@ async def _llm_json_with_retry(model: str, prompt: str, validator, max_retries: 
         except ValidationError as e:
             console.print(f"[yellow]Validation error (attempt {attempt + 1}/{max_retries}):[/yellow] {e}")
             if attempt < max_retries - 1:
+                console.print("[yellow]Retrying...[/yellow]")
                 prompt += f"\n\nPREVIOUS ERROR: {e}\nFix the JSON structure and try again."
         except Exception as e:
             console.print(f"[red]Parse error: {e}[/red]")
             if attempt < max_retries - 1:
+                console.print("[yellow]Retrying...[/yellow]")                                                                                                     
                 prompt += f"\n\nPREVIOUS ERROR: {e}\nFix the JSON and try again."
     console.print(f"[red]Failed after {max_retries} attempts[/red]")
     if raw_json:

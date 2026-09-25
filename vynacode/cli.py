@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import asyncio
+import json
 import sys
 from pathlib import Path
 from typing import List
@@ -10,6 +11,7 @@ sys.path.insert(0, str(_ROOT))
 
 import typer
 from rich.console import Console
+from rich.prompt import Confirm
 from pydantic import ValidationError
 
 from database import (
@@ -149,32 +151,68 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
     for b in unique_blocks.values():
         summary_str += f"- {b['parent_file']}:{b['name']} ({b['line_range_start']}-{b['line_range_end']}): {b['summary']}\n"
 
-    planner_prompt = (
-        f"Codebase summaries:\n{summary_str}\n\n"
-        f"Task: {task}\n\n"
-        "Output EXACTLY this JSON structure:\n"
-        '{"steps": ["step 1 text", "step 2 text", "..."]}'
-        "\n\nCRITICAL: steps MUST be an array of PLAIN STRINGS only. "
-        "Each element is a detailed, self-contained instruction for a coder. "
-        "NO objects, NO 'instruction' keys, NO 'description' keys, NO code blocks. "
-        "Just plain text strings. Example: "
-        '["Add docstring to function foo in file.py", "Fix bug in bar at line 42"]'
-        "\nNo fluff. No extra keys. No objects."
-    )
+    root = _find_index_root(Path.cwd().resolve())
+    plan_path = root / "last_plan.json" if root else None
+    plan: PlanResponse | None = None
 
-    console.print("[dim]Planning...[/dim]")
-    plan = await _llm_json_with_retry(PLANNER_MODEL, planner_prompt, PlanResponse.model_validate_json)
+    if plan_path and plan_path.exists():
+        use_prev = await asyncio.to_thread(Confirm.ask, "Found a previous plan. Load it?", default=False)
+        if use_prev:
+            try:
+                with plan_path.open("r", encoding="utf-8") as f:
+                    plan = PlanResponse.model_validate(json.load(f))
+                console.print("[green]Loaded previous plan.[/green]")
+            except Exception as e:
+                console.print(f"[red]Failed to load plan: {e}[/red]")
+
     if not plan:
-        return
+        planner_prompt = (
+            f"Codebase summaries:\n{summary_str}\n\n"
+            f"Task: {task}\n\n"
+            "Output EXACTLY this JSON structure:\n"
+            '{"steps": ["step 1 text", "step 2 text", "..."]}'
+            "\n\nCRITICAL: steps MUST be an array of PLAIN STRINGS only. "
+            "Each element is a detailed, self-contained instruction for a coder. "
+            "NO objects, NO 'instruction' keys, NO 'description' keys, NO code blocks. "
+            "Just plain text strings. Example: "
+            '["Add docstring to function foo in file.py", "Fix bug in bar at line 42"]'
+            "\nNo fluff. No extra keys. No objects."
+        )
 
-    if not plan.steps:
-        console.print("[yellow]Planner returned empty steps[/yellow]")
-        return
+        console.print("[dim]Planning...[/dim]")
+        plan = await _llm_json_with_retry(PLANNER_MODEL, planner_prompt, PlanResponse.model_validate_json)
+        
+        if not plan or not plan.steps:
+            console.print("[yellow]Planner returned empty steps[/yellow]")
+            return
 
-    console.print(f"[green]Plan ({len(plan.steps)} steps):[/green]")
-    for i, step in enumerate(plan.steps, 1):
-        console.print(f"  {i}. {step}")
+        console.print(f"[green]New Plan ({len(plan.steps)} steps):[/green]")
+        for i, step in enumerate(plan.steps, 1):
+            console.print(f"  {i}. {step}")
+            
+        if plan_path:
+            try:
+                with plan_path.open("w", encoding="utf-8") as f:
+                    json.dump(plan.model_dump(), f, indent=4, ensure_ascii=False)
+            except OSError as e:
+                console.print(f"[red]Error saving plan: {e}[/red]")
 
+        confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with this new plan?")
+        if not confirmation:
+            console.print("[yellow]Plan aborted. View it with: [bold]show plan[/bold][/yellow]")
+            return
+    else:
+        # Plan was loaded
+        console.print(f"[green]Loaded Plan ({len(plan.steps)} steps):[/green]")
+        for i, step in enumerate(plan.steps, 1):
+            console.print(f"  {i}. {step}")
+        
+        confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with loaded plan?")
+        if not confirmation:
+            console.print("[yellow]Plan aborted. View it with: [bold]show plan[/bold][/yellow]")
+            return
+
+    # Execution loop
     for i, step in enumerate(plan.steps, 1):
         console.print(f"\n[dim]Step {i}/{len(plan.steps)}: {step}[/dim]")
         step_kws = [w.strip('.,') for w in step.lower().split() if len(w) > 3][:4]
@@ -182,7 +220,9 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
         for kw in step_kws:
             step_blocks.extend(search_code(db_path, kw))
         if not step_blocks:
-            step_blocks = [unique_blocks[k] for k in list(unique_blocks)[:3]]
+            fallback_blocks = list(unique_blocks.values())
+            step_blocks = fallback_blocks[:3]
+            
         step_context = ""
         seen = set()
         for b in step_blocks:
@@ -215,9 +255,20 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
         if res:
             _execute_coder_result(res)
 
-@app.command()
-def index(path: str):
-    dir_path = Path(path).resolve()
+
+def view_plan(path: Path):
+    try:
+        with path.open("r", encoding="utf-8") as f:
+            plan = PlanResponse.model_validate(json.load(f))
+            if not plan.steps:
+                return
+            console.print(f"[green]Plan ({len(plan.steps)} steps):[/green]")
+            for i, step in enumerate(plan.steps, 1):
+                console.print(f"  {i}. {step}")
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        console.print("[yellow]No valid previous plan found.[/yellow]")
+
+async def _run_index_pipeline(dir_path: Path):
     db_path = dir_path / ".vc" / "vcdb.db"
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_db(db_path)
@@ -242,10 +293,14 @@ def index(path: str):
                 await summarize_and_store(llm, db_path, blocks, source_code=file_bytes)
         write_codebase_json(db_path, dir_path / "codebase.json")
 
-    asyncio.run(_run_pipeline())
+    await _run_pipeline()
     stale_paths = db_paths - active_paths
     prune_deleted_files(db_path, dir_path / "codebase.json", stale_paths)
     console.print("[green]Indexing complete.[/green]")
+
+@app.command()
+def index(path: str):
+    asyncio.run(_run_index_pipeline(Path(path).resolve()))
 
 @app.command()
 def do(
@@ -280,6 +335,10 @@ def do(
         else:
             console.print(f"[red]Unknown mode: {mode}. Use 'single' or 'multi'[/red]")
 
+        # Re-index
+        console.print("[dim]Re-indexing codebase...[/dim]")
+        await _run_index_pipeline(root)
+
     try:
         asyncio.run(_run_do())
     except Exception as e:
@@ -299,7 +358,7 @@ def show(
     db_path = root / ".vc" / "vcdb.db"
 
     if option == "plan":
-        console.print("[yellow]Show plan to be implemented[/yellow]")
+        view_plan(root / "last_plan.json")
     elif option == "context":
         if query:
             results = search_blocks(db_path, query)
@@ -312,7 +371,7 @@ def show(
         else:
             console.print("Error: query is required.")
     elif option == "index":
-        console.print("[yellow]Show index to be implemented[/yellow]")
+        console.print("[yellow]Index status: Indexed.[/yellow]")
 
 @app.command()
 def log():

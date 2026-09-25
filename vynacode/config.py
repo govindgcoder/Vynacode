@@ -6,21 +6,20 @@ VYNARC_PATH = BASE_DIR / ".vynarc"
 
 config_data = {}
 
-if NAMERC_PATH.exists():
+if VYNARC_PATH.exists():
     try:
-        with open(NAMERC_PATH, "r") as f:
+        with open(VYNARC_PATH, "r") as f:
             config_data = json.load(f)
     except json.JSONDecodeError:
-        print("Error: .vynarc is not a valid JSON file.")
-else:
-    print("Warning: .vynarc file not found. Using empty or default settings.")
+        pass
 
 ROOT = config_data.get("root")
 OLLAMA_URL = config_data.get("ollama_url", "http://localhost:11434")
-PLANNER_MODEL = config_data.get("planner_model", "gemma4:e4b")
-CODER_MODEL = config_data.get("coder_model", "qwen2.5-coder:7b")
+PLANNER_MODEL = config_data.get("planner_model", "reecdev/qwen3.5-lowvram:9b")
+CODER_MODEL = config_data.get("coder_model", "reecdev/qwen3.5-lowvram:9b")
 CONTEXT_WINDOW = config_data.get("context_window", 8192)
-TIER = config_data.get("tier", "free")
+TIER = "free"
+TOKEN_BUDGET = 2048
 
 
 def get_setting(key, default=None):

@@ -1,4 +1,5 @@
 import hashlib
+from pathlib import Path
 
 chunk_size = 65536
 
@@ -19,7 +20,7 @@ from schema import FileMetaData
 
 def build_pathspec(base: Path):
     files = [".gitignore", ".vynaignore"]
-    lines = []
+    lines = [".git/", ".vc/", "codebase.json", "codebase.md"]
     for file in files:
         path = base / file
         try:

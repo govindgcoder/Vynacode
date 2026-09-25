@@ -374,7 +374,16 @@ def show(
         else:
             console.print("Error: query is required.")
     elif option == "index":
-        console.print("[yellow]Index status: Indexed.[/yellow]")
+        index_path = root / "codebase.json"
+        if index_path.exists():
+            try:
+                with index_path.open("r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    console.print(json.dumps(data, indent=2))
+            except Exception as e:
+                console.print(f"[red]Error reading index: {e}[/red]")
+        else:
+            console.print("[yellow]No codebase.json found.[/yellow]")")
 
 @app.command()
 def log():

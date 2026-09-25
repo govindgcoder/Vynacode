@@ -1,4 +1,7 @@
 import json
+from typing import List
+
+from schema import ExpandQueryResponse
 
 import httpx
 
@@ -15,12 +18,20 @@ class OllamaClient:
         except httpx.ConnectError:
             return False
 
+    async def expand_query(self, model: str, query: str) -> List[str]:
+        """Generates 10-12 related single-word keywords from a prompt."""
+        prompt = f"Respond with a JSON object with a single key 'keywords' containing a comma-separated list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no spaces within keywords."
+        content = await self.complete(model, "user", prompt, format="json")
+        parsed = ExpandQueryResponse.model_validate_json(content)
+        return [kw.strip() for kw in parsed.keywords.split(",") if kw.strip()]
+
     async def complete(self, model: str, role: str, prompt: str, think: bool = False, format=None):
         payload = {
             "model": model,
             "messages": [{"role": role, "content": prompt}],
             "stream": False,
             "think": think,
+            "options": {"num_predict": 4096},
         }
         if format is not None:
             payload["format"] = format
@@ -35,10 +46,10 @@ class OllamaClient:
             "messages": [{"role": role, "content": prompt}],
             "stream": True,
             "think": think,
+            "options": {"num_predict": 4096},
         }
         if format is not None:
             payload["format"] = format
-
         async with self._client.stream(
             "POST", f"{self.base_url}/api/chat", json=payload
         ) as response:

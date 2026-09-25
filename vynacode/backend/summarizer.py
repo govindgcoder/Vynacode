@@ -56,6 +56,8 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
             current_batch = []
             current_tokens = 0
 
+            print(f"processed {no_of_blocks}/{total_no} in {block.parent_file}")
+
     if update_data:
         with sqlite3.connect(db_path) as conn:
             conn.executemany("UPDATE blocks SET summary = ? WHERE id = ?", update_data)

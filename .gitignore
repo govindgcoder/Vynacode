@@ -8,3 +8,5 @@ dist/
 .vynarc
 
 .python-version
+
+codebase.json

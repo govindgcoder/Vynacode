@@ -46,14 +46,13 @@ def parse_python_file(filepath: Path) -> List[Block]:
                 start_byte = node.start_byte
                 end_byte = node.end_byte
                 line_range = (node.start_point[0], node.end_point[0])
-                name_parent = node.parent.child_by_field_name("name")
-                if not name_parent:
-                    name_parent = "file"
+                name_parent_node = node.parent.child_by_field_name("name")
+                if node.parent.type == "module":
+                    id_parent = None
                 else:
-                    name_parent = name_parent.text.decode("utf-8")
-
-                str_val_parent = f"{filepath}:{name_parent}:{node.parent.start_byte}"
-                id_parent = hashlib.sha256(str_val_parent.encode()).hexdigest()
+                    name_parent = name_parent_node.text.decode("utf-8") if name_parent_node else "unknown"
+                    str_val_parent = f"{filepath}:{name_parent}:{node.parent.start_byte}"
+                    id_parent = hashlib.sha256(str_val_parent.encode()).hexdigest()
                 return_node = node.child_by_field_name("return_type")
                 returns_val = return_node.text.decode("utf-8") if return_node else None
                 block_list.append(

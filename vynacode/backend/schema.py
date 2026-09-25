@@ -5,10 +5,33 @@ from typing import List, Optional, Tuple
 from pydantic import BaseModel, Field, RootModel, computed_field
 
 
-class Parameter(BaseModel):
-    name: Optional[str] = None
-    type: Optional[str] = None
+class ExpandQueryResponse(BaseModel):
+    keywords: str
 
+class PlanResponse(BaseModel):
+    steps: List[str]
+
+class Parameter(BaseModel):
+    name: str
+
+class Patch(BaseModel):
+    file_path: str
+    start_line: int
+    end_line: int
+    new_text: str
+
+class WriteAction(BaseModel):
+    file_path: str
+    patch: str  # Unified diff format
+
+class RunAction(BaseModel):
+    command: str
+
+class DoResponse(BaseModel):
+    thought: str
+    response: str
+    write: Optional[List[WriteAction]] = None
+    run: Optional[List[RunAction]] = None
 
 class Block(BaseModel):
     id: str
@@ -31,7 +54,6 @@ class Block(BaseModel):
     def token_estimate(self) -> int:
         return (self.byte_end - self.byte_start) // 3
 
-
 class FileMetaData(BaseModel):
     name: str
     path: Path
@@ -41,17 +63,14 @@ class FileMetaData(BaseModel):
     imports: List[str] = Field(default_factory=list)
     blocks: List[Block] = Field(default_factory=list)
 
-
-# to prevent any negative value ge is used
 class SystemStats(BaseModel):
     files: int = Field(..., ge=0)
     blocks: int = Field(..., ge=0)
     tokens_used: int = Field(..., ge=0)
-
 
 class VynacodeManifest(BaseModel):
     vynacode_version: str
     indexed_at: datetime
     root: Path
     stats: SystemStats
-    files: List[FileMetadata]
+    files: List[FileMetaData]

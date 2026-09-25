@@ -159,14 +159,20 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
     plan: PlanResponse | None = None
 
     if plan_path and plan_path.exists():
-        use_prev = await asyncio.to_thread(Confirm.ask, "Found a previous plan. Load it?", default=False)
-        if use_prev:
-            try:
-                with plan_path.open("r", encoding="utf-8") as f:
-                    plan = PlanResponse.model_validate(json.load(f))
-                console.print("[green]Loaded previous plan.[/green]")
-            except Exception as e:
-                console.print(f"[red]Failed to load plan: {e}[/red]")
+        try:
+            with plan_path.open("r", encoding="utf-8") as f:
+                plan_data = json.load(f)
+                if plan_data.get("original_prompt") == task:
+                    plan = PlanResponse.model_validate(plan_data)
+                    console.print("[green]Loaded previous plan (matched prompt).[/green]")
+                else:
+                    plan = None
+                    console.print("[yellow]Found a previous plan, but it doesn't match the current task. Creating new plan...[/yellow]")
+        except Exception as e:
+            console.print(f"[red]Failed to load plan: {e}[/red]")
+            plan = None
+    else:
+        plan = None
 
     if not plan:
         planner_prompt = (
@@ -196,7 +202,9 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
         if plan_path:
             try:
                 with plan_path.open("w", encoding="utf-8") as f:
-                    json.dump(plan.model_dump(), f, indent=4, ensure_ascii=False)
+                    plan_to_save = plan.model_dump()
+                    plan_to_save["original_prompt"] = task
+                    json.dump(plan_to_save, f, indent=4, ensure_ascii=False)
             except OSError as e:
                 console.print(f"[red]Error saving plan: {e}[/red]")
 
@@ -383,7 +391,7 @@ def show(
             except Exception as e:
                 console.print(f"[red]Error reading index: {e}[/red]")
         else:
-            console.print("[yellow]No codebase.json found.[/yellow]")")
+            console.print("[yellow]No codebase.json found.[/yellow]")
 
 @app.command()
 def log():

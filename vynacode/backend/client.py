@@ -1,7 +1,26 @@
 import json
+import re
 from typing import List
 
 from schema import ExpandQueryResponse
+
+# Summaries are English prose, so a function word matches any block whose
+# summary happens to contain it. Measured: 'the' alone retrieved four unrelated
+# blocks and pushed a real target out of the budget.
+_STOPWORDS = frozenset(
+    "a an and are as at be but by for from has have if in into is it its of on "
+    "or that the this to was were what when where which who will with you your".split()
+)
+
+
+def own_terms(text: str) -> List[str]:
+    """Identifiers and content words of a prompt, deduplicated, in order.
+
+    Shared with the step keyword extraction in cli.py so that a prompt and a
+    planned step are tokenised by the same rules.
+    """
+    tokens = (w.lower() for w in re.findall(r"[A-Za-z0-9_]{3,}", text))
+    return [w for w in dict.fromkeys(tokens) if not w.isdigit() and w not in _STOPWORDS]
 
 import httpx
 
@@ -23,7 +42,10 @@ class OllamaClient:
         prompt = f"Respond with a JSON object with a single key 'keywords' containing a comma-separated list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no spaces within keywords."
         content = await self.complete(model, "user", prompt, format="json")
         parsed = ExpandQueryResponse.model_validate_json(content)
-        return [kw.strip() for kw in parsed.keywords.split(",") if kw.strip()]
+        keywords = [kw.strip() for kw in parsed.keywords.split(",") if kw.strip()]
+        # A small model asked for "related keywords" answers with abstractions and
+        # drops the literal symbol, so the prompt's own words are searched too.
+        return list(dict.fromkeys([*keywords, *own_terms(query)]))
 
     async def complete(self, model: str, role: str, prompt: str, think: bool = False, format=None):
         payload = {

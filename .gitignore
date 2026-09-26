@@ -10,3 +10,4 @@ dist/
 .python-version
 
 codebase.json
+.vc/

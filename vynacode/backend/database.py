@@ -1,9 +1,11 @@
 import sqlite3
 import json
+import re
 from collections import defaultdict
 from pathlib import Path
 from typing import List
 from schema import Block, FileMetaData
+from config import TOKEN_BUDGET
 
 def init_db(db_path: Path):
     with sqlite3.connect(str(db_path)) as con:
@@ -66,8 +68,26 @@ def init_db(db_path: Path):
                     END;
                     """)
 
+def _fts_term(query: str) -> str:
+    """Quote a raw term as a single FTS5 token, with prefix matching enabled.
+
+    FTS5 treats . + ` ( ) * and - as query syntax, so an unquoted keyword such
+    as `user.id` or `C++` raises OperationalError instead of returning nothing.
+    Doubling embedded quotes is required: a bare `a"b` is an unterminated
+    string. The trailing * is prefix search, kept outside the closing quote so
+    it is a prefix query rather than part of the phrase.
+    """
+    query = query.strip()
+    if not query:
+        return ""
+    return '"' + query.replace('"', '""') + '"*'
+
+
 def search_blocks(db_path: Path, query: str) -> List[dict]:
     """Search blocks using FTS5 with BM25 scoring."""
+    term = _fts_term(query)
+    if not term:
+        return []
     with sqlite3.connect(str(db_path)) as con:
         con.row_factory = sqlite3.Row
         cursor = con.execute(
@@ -78,60 +98,118 @@ def search_blocks(db_path: Path, query: str) -> List[dict]:
             WHERE blocks_fts MATCH ?
             ORDER BY bm25(blocks_fts)
             """,
-            (query,)
+            (term,)
         )
         return [dict(row) for row in cursor.fetchall()]
 
 
-def search_code(db_path: Path, query: str) -> List[dict]:
-    """Search blocks and retrieve actual source code using line numbers."""
+def _block_result(block: dict) -> dict:
+    """Read a block's byte range and return every metadata field plus its code."""
+    try:
+        with open(block['parent_file'], 'rb') as f:
+            f.seek(block['byte_start'])
+            code = f.read(block['byte_end'] - block['byte_start']).decode('utf-8', errors='replace')
+    except OSError:
+        code = ''
+    return {
+        # Pass the whole row through so search_code never silently drops a
+        # metadata field again; only params/is_async need retyping.
+        **block,
+        'is_async': bool(block['is_async']),
+        'params': json.loads(block['params']) if block['params'] else [],
+        'dependencies': json.loads(block['dependencies']) if block['dependencies'] else [],
+        'code': code,
+        'token_estimate': (block['byte_end'] - block['byte_start']) // 3,
+    }
+
+
+def resolve_all_dependencies(db_path: Path):
+    """Fill blocks.dependencies with the other block names each block references.
+
+    Runs as a second pass over the finished index so resolution is
+    order-independent: a block indexed first must still see blocks from files
+    parsed later. Records direct references only, so nothing here implies a
+    transitive walk.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, name, parent_file, byte_start, byte_end FROM blocks")]
+        names = {r['name'] for r in rows}
+        by_file = defaultdict(list)
+        for r in rows:
+            by_file[r['parent_file']].append(r)
+
+        updates = []
+        for r in rows:
+            try:
+                with open(r['parent_file'], 'rb') as f:
+                    f.seek(r['byte_start'])
+                    src = f.read(r['byte_end'] - r['byte_start']).decode('utf-8', errors='replace')
+            except OSError:
+                continue
+            # \b keeps a block named `run` from matching inside `runner`.
+            found = (names & set(re.findall(r"\b\w+\b", src))) - {r['name']}
+            # A block nested inside this one (a class naming its own methods) is
+            # already present in its code, so counting it as a dependency would
+            # re-send code the caller already has.
+            found -= {
+                o['name'] for o in by_file[r['parent_file']]
+                if o['name'] != r['name'] and r['byte_start'] <= o['byte_start'] < r['byte_end']
+            }
+            updates.append((json.dumps(sorted(found)), r['id']))
+        con.executemany("UPDATE blocks SET dependencies = ? WHERE id = ?", updates)
+
+
+def search_code(db_path: Path, query: str, token_budget: int = TOKEN_BUDGET) -> List[dict]:
+    """Search blocks and retrieve byte-accurate source code within a token budget.
+
+    search_blocks yields BM25 rank order, so exhausting the budget degrades to
+    "the best N matches" rather than an arbitrary subset. The budget is only
+    enforced once one block is in hand, because a caller holding an empty
+    context patches blind.
+    """
     blocks = search_blocks(db_path, query)
-    # YAGNI: if no matches, fallback to all blocks so small projects don't get 0 results
-    if not blocks:
+    results = []
+    tokens_used = 0
+    for block in blocks:
+        est_tokens = (block['byte_end'] - block['byte_start']) // 3
+        if results and tokens_used + est_tokens > token_budget:
+            break
+        result = _block_result(block)
+        tokens_used += est_tokens
+        results.append(result)
+
+    have = {r['id'] for r in results}
+    dep_names = []
+    for r in results:
+        for name in r['dependencies']:
+            if name not in have:
+                have.add(name)
+                dep_names.append(name)
+    if dep_names:
+        marks = ",".join("?" * len(dep_names))
         with sqlite3.connect(str(db_path)) as con:
             con.row_factory = sqlite3.Row
-            blocks = [dict(r) for r in con.execute("SELECT * FROM blocks LIMIT 20").fetchall()]
-    results = []
-    file_cache = {}
-    for block in blocks:
-        file_path = block['parent_file']
-        if file_path not in file_cache:
-            try:
-                with open(file_path, 'r', encoding='utf-8') as f:
-                    file_cache[file_path] = f.readlines()
-            except (FileNotFoundError, OSError):
-                file_cache[file_path] = None
-        lines = file_cache.get(file_path)
-        if lines:
-            # line_range is 0-indexed from tree-sitter; handle both 0 and 1-indexed
-            start = max(0, block['line_range_start'] - 1) if block['line_range_start'] > 0 else 0
-            end = block['line_range_end']
-            # if end is 0 (empty function), fallback to byte range or full file
-            if end <= start:
-                # use byte range as fallback
-                try:
-                    with open(file_path, 'r', encoding='utf-8') as f:
-                        content = f.read()
-                    code = content[block['byte_start']:block['byte_end']] if block['byte_start'] < len(content) else ''.join(lines[start:start+10])
-                except (OSError, UnicodeDecodeError):
-                    code = ''.join(lines[start:start+10]) if start < len(lines) else ''
-            else:
-                code = ''.join(lines[start:end]) if start < len(lines) else ''
-        else:
-            code = ''
-        results.append({
-            'parent_file': block['parent_file'],
-            'name': block['name'],
-            'type': block['type'],
-            'line_range_start': block['line_range_start'],
-            'line_range_end': block['line_range_end'],
-            'summary': block['summary'],
-            'code': code
-        })
+            dep_rows = [dict(x) for x in con.execute(
+                f"SELECT * FROM blocks WHERE name IN ({marks})", dep_names)]
+        for row in dep_rows:
+            if row['id'] in have:
+                continue
+            est_tokens = (row['byte_end'] - row['byte_start']) // 3
+            if results and tokens_used + est_tokens > token_budget:
+                break
+            result = _block_result(row)
+            tokens_used += est_tokens
+            results.append(result)
     return results
 
 def upsert_file_metadata(db_path: Path, metadata: FileMetaData):
     with sqlite3.connect(str(db_path)) as con:
+        # Per-connection and OFF by default in SQLite. init_db sets it, but the
+        # pragma is not inherited, so every connection that writes must re-enable
+        # it or blocks can be inserted against a files row that does not exist.
+        con.execute("PRAGMA foreign_keys = ON;")
         con.execute(
             "INSERT INTO files (path, hash, language, size_bytes) VALUES (?, ?, ?, ?) "
             "ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, language = excluded.language, size_bytes = excluded.size_bytes",
@@ -146,6 +224,10 @@ def delete_blocks_for_file(db_path: Path, parent_file: str):
 
 def upsert_block(db_path: Path, parent_file: str, blocks: List[Block]):
     with sqlite3.connect(str(db_path)) as con:
+        # Load-bearing: blocks.parent_file references files(path) ON DELETE CASCADE.
+        # Without this the FK is unenforced, which is how orphaned blocks for
+        # deleted files accumulated. upsert_file_metadata must run first.
+        con.execute("PRAGMA foreign_keys = ON;")
         for block in blocks:
             params_json = json.dumps(
                 [p.model_dump() for p in block.params] if block.params else []
@@ -208,17 +290,14 @@ def ensure_indexed(db_path: Path) -> bool:
     return db_path.exists()
 
 def prune_deleted_files(db_path: Path, codebase_json: Path, stale_paths):
-    # YAGNI: no-op if nothing stale; avoids rewriting JSON needlessly
     if not stale_paths:
         return
-    # 1. Delete from DB with FK cascade (removes blocks + FTS entries via triggers)
     with sqlite3.connect(str(db_path)) as con:
         con.execute("PRAGMA foreign_keys = ON;")
         for p in stale_paths:
             con.execute("DELETE FROM files WHERE path=?", (str(p),))
         con.commit()
 
-    # 2. Remove from codebase.json — tolerate missing/corrupt file
     try:
         with open(codebase_json, "r", encoding="utf-8") as f:
             codebase_data = json.load(f)

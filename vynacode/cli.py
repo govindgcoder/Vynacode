@@ -4,7 +4,7 @@ import json
 import re #for regex
 import sys
 from pathlib import Path
-from typing import List, Tuple
+from typing import List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT / "backend"))
@@ -26,7 +26,10 @@ from client import OllamaClient, own_terms
 from summarizer import summarize_and_store
 from schema import DoResponse, PlanResponse
 
-from vynacode.config import CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET
+from vynacode.config import (
+    CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET, TIER,
+    config_path, current_settings, is_overridden, save_config,
+)
 
 app = typer.Typer()
 console = Console()
@@ -640,8 +643,48 @@ def log():
     console.print("Log! to be implemented")
 
 @app.command()
-def models():
-    console.print(f"Active model: {CODER_MODEL}")
+def config(
+    coder_model: Optional[str] = typer.Option(None, "--coder-model", "-c", help="Model that writes code"),
+    planner_model: Optional[str] = typer.Option(None, "--planner-model", "-p", help="Model that plans and summarises"),
+    context_window: Optional[int] = typer.Option(None, "--context-window", "-w", help="Model context window, in tokens"),
+    ollama_url: Optional[str] = typer.Option(None, "--ollama-url", "-u", help="Ollama base URL"),
+):
+    updates: dict = {}
+    if coder_model is not None:
+        updates["coder_model"] = coder_model
+    if planner_model is not None:
+        updates["planner_model"] = planner_model
+    if ollama_url is not None:
+        updates["ollama_url"] = ollama_url
+    if context_window is not None:
+        # Guards the budget arithmetic rather than the value: a zero or
+        # negative window would make every later context cap collapse.
+        if context_window < 1:
+            console.print("[red]Error: --context-window must be a positive integer.[/red]")
+            raise typer.Exit(1)
+        updates["context_window"] = context_window
+
+    if updates:
+        path = save_config(updates)
+        changed = ", ".join(sorted(updates))
+        console.print(f"[green]Saved {changed}[/green] -> {path}")
+        console.print("[dim]Applies to the next command; this process keeps its loaded values.[/dim]")
+
+    active = config_path()
+    exists = active.exists()
+    console.print(f"\n[bold]Config file:[/bold] {active}")
+    console.print(
+        "[dim]in use[/dim]" if exists else "[yellow]not created yet - defaults in use[/yellow]"
+    )
+
+    console.print("\n[bold]Settings[/bold]")
+    for key, value in current_settings().items():
+        origin = "file" if is_overridden(key) else "default"
+        console.print(f"  {key:<15} {value}  [dim]({origin})[/dim]")
+
+    console.print("\n[bold]Read-only[/bold]")
+    console.print(f"  {'tier':<15} {TIER}")
+    console.print(f"  {'token_budget':<15} {TOKEN_BUDGET}")
 
 @app.command()
 def doctor():

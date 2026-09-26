@@ -15,8 +15,8 @@ if VYNARC_PATH.exists():
 
 ROOT = config_data.get("root")
 OLLAMA_URL = config_data.get("ollama_url", "http://localhost:11434")
-PLANNER_MODEL = config_data.get("planner_model", "reecdev/qwen3.5-lowvram:9b")
-CODER_MODEL = config_data.get("coder_model", "reecdev/qwen3.5-lowvram:9b")
+PLANNER_MODEL = config_data.get("planner_model", "qwen2.5-coder:1.5b")
+CODER_MODEL = config_data.get("coder_model", "qwen2.5-coder:1.5b")
 CONTEXT_WINDOW = config_data.get("context_window", 8192)
 TIER = "free"
 TOKEN_BUDGET = 2048

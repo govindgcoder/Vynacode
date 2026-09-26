@@ -13,6 +13,7 @@ class PlanResponse(BaseModel):
 
 class Parameter(BaseModel):
     name: str
+    annotation: Optional[str] = None
 
 class Patch(BaseModel):
     file_path: str

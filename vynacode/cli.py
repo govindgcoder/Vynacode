@@ -554,13 +554,15 @@ async def _run_index_pipeline(dir_path: Path):
     prune_deleted_files(db_path, dir_path / "codebase.json", stale_paths)
     console.print("[green]Indexing complete.[/green]")
 
-@app.command()
-def index(path: str):
+@app.command(help="Index a directory: parse, summarise and store code blocks.")
+def index(
+    path: str = typer.Argument(".", help="Directory to index"),
+):
     asyncio.run(_run_index_pipeline(Path(path).resolve()))
 
-@app.command()
+@app.command(help="Act on a request: retrieve context, then propose patches and commands.")
 def do(
-    message: str,
+    message: str = typer.Argument(..., help="Task description in plain English"),
     mode: str = typer.Option("single", help="single (coder JSON) or multi (planner + coder JSON)"),
 ):
     async def _run_do():
@@ -602,7 +604,7 @@ def do(
         import traceback as _tb
         _tb.print_exc()
 
-@app.command()
+@app.command(help="Inspect the index: last plan, search results, or the full codebase.json.")
 def show(
     option: str = typer.Argument(default="plan", help="Option to show: plan, context, index"),
     query: str = typer.Option(None, "--query", "-q", help="Search query for context"),
@@ -638,11 +640,11 @@ def show(
         else:
             console.print("[yellow]No codebase.json found.[/yellow]")
 
-@app.command()
+@app.command(help="Show run history.")
 def log():
     console.print("Log! to be implemented")
 
-@app.command()
+@app.command(help="Show or update configuration.")
 def config(
     coder_model: Optional[str] = typer.Option(None, "--coder-model", "-c", help="Model that writes code"),
     planner_model: Optional[str] = typer.Option(None, "--planner-model", "-p", help="Model that plans and summarises"),
@@ -686,7 +688,7 @@ def config(
     console.print(f"  {'tier':<15} {TIER}")
     console.print(f"  {'token_budget':<15} {TOKEN_BUDGET}")
 
-@app.command()
+@app.command(help="Check the environment: Ollama reachability, models, index state.")
 def doctor():
     console.print("Doctor! to be implemented")
 

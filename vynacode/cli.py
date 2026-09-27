@@ -424,7 +424,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
 
         console.print(f"[green]New Plan ({len(plan.steps)} steps):[/green]")
         for i, step in enumerate(plan.steps, 1):
-            console.print(f"  {i}. {step}")
+            console.print(f"  [cyan]{i}.[/cyan] {step}")
             
         if plan_path:
             try:
@@ -443,7 +443,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
         # Plan was loaded
         console.print(f"[green]Loaded Plan ({len(plan.steps)} steps):[/green]")
         for i, step in enumerate(plan.steps, 1):
-            console.print(f"  {i}. {step}")
+            console.print(f"  [cyan]{i}.[/cyan] {step}")
         
         confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with loaded plan?")
         if not confirmation:
@@ -512,7 +512,7 @@ def view_plan(path: Path):
                 return
             console.print(f"[green]Plan ({len(plan.steps)} steps):[/green]")
             for i, step in enumerate(plan.steps, 1):
-                console.print(f"  {i}. {step}")
+                console.print(f"  [cyan]{i}.[/cyan] {step}")
     except (FileNotFoundError, json.JSONDecodeError, OSError):
         console.print("[yellow]No valid previous plan found.[/yellow]")
 
@@ -621,13 +621,13 @@ def show(
         if query:
             results = search_blocks(db_path, query)
             if not results:
-                console.print("No results found!")
+                console.print("[yellow]No results found![/yellow]")
             for i, block in enumerate(results, 1):
-                console.print(f"\n[bold]Result {i}:[/bold] {block['name']} in {block['parent_file']}")
-                console.print(f"  Lines: {block['line_range_start']}-{block['line_range_end']}")
-                console.print(f"  Summary: {block['summary']}")
+                console.print(f"\n[bold cyan]Result {i}:[/bold cyan] [bold]{block['name']}[/bold] in [magenta]{block['parent_file']}[/magenta]")
+                console.print(f"  [dim]Lines:[/dim] {block['line_range_start']}-{block['line_range_end']}")
+                console.print(f"  [dim]Summary:[/dim] {block['summary']}")
         else:
-            console.print("Error: query is required.")
+            console.print("[red]Error: query is required.[/red]")
     elif option == "index":
         index_path = root / "codebase.json"
         if index_path.exists():
@@ -642,7 +642,7 @@ def show(
 
 @app.command(help="Show run history.")
 def log():
-    console.print("Log! to be implemented")
+    console.print("[yellow]Log! to be implemented[/yellow]")
 
 @app.command(help="Show or update configuration.")
 def config(
@@ -669,28 +669,28 @@ def config(
     if updates:
         path = save_config(updates)
         changed = ", ".join(sorted(updates))
-        console.print(f"[green]Saved {changed}[/green] -> {path}")
+        console.print(f"[green]Saved[/green] [bold]{changed}[/bold] [dim]->[/dim] {path}")
         console.print("[dim]Applies to the next command; this process keeps its loaded values.[/dim]")
 
     active = config_path()
     exists = active.exists()
-    console.print(f"\n[bold]Config file:[/bold] {active}")
+    console.print(f"\n[bold]Config file:[/bold] [cyan]{active}[/cyan]")
     console.print(
-        "[dim]in use[/dim]" if exists else "[yellow]not created yet - defaults in use[/yellow]"
+        "  [green]in use[/green]" if exists else "  [yellow]not created yet - defaults in use[/yellow]"
     )
 
     console.print("\n[bold]Settings[/bold]")
     for key, value in current_settings().items():
         origin = "file" if is_overridden(key) else "default"
-        console.print(f"  {key:<15} {value}  [dim]({origin})[/dim]")
+        console.print(f"  [bold]{key:<15}[/bold] [cyan]{value}[/cyan]  [dim]({origin})[/dim]")
 
     console.print("\n[bold]Read-only[/bold]")
-    console.print(f"  {'tier':<15} {TIER}")
-    console.print(f"  {'token_budget':<15} {TOKEN_BUDGET}")
+    console.print(f"  [bold]{'tier':<15}[/bold] [magenta]{TIER}[/magenta]")
+    console.print(f"  [bold]{'token_budget':<15}[/bold] [magenta]{TOKEN_BUDGET}[/magenta]")
 
 @app.command(help="Check the environment: Ollama reachability, models, index state.")
 def doctor():
-    console.print("Doctor! to be implemented")
+    console.print("[yellow]Doctor! to be implemented[/yellow]")
 
 if __name__ == "__main__":
     app()

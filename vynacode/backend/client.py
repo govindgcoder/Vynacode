@@ -37,17 +37,27 @@ class OllamaClient:
         except httpx.ConnectError:
             return False
 
-    async def expand_query(self, model: str, query: str) -> List[str]:
-        """Generates 10-12 related single-word keywords from a prompt."""
+    async def expand_query(self, model: str, query: str, retry=None, verbose: bool = False):
+        """Generates 10-12 related single-word keywords from a prompt.
+
+        retry is the caller's json-with-retry loop, so a model returning the
+        wrong JSON shape is retried rather than killing the run.
+        """
         prompt = f"Respond with a JSON object with a single key 'keywords' containing a comma-separated list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no spaces within keywords."
-        content = await self.complete(model, "user", prompt, format="json")
-        parsed = ExpandQueryResponse.model_validate_json(content)
+        if retry:
+            parsed = await retry(model, prompt, ExpandQueryResponse.model_validate_json, verbose=verbose)
+        else:
+            parsed = ExpandQueryResponse.model_validate_json(
+                await self.complete(model, "user", prompt, format="json")
+            )
+        if parsed is None:
+            return list(own_terms(query))
         keywords = [kw.strip() for kw in parsed.keywords.split(",") if kw.strip()]
         # A small model asked for "related keywords" answers with abstractions and
         # drops the literal symbol, so the prompt's own words are searched too.
         return list(dict.fromkeys([*keywords, *own_terms(query)]))
 
-    async def complete(self, model: str, role: str, prompt: str, think: bool = False, format=None):
+    async def _chat(self, model: str, role: str, prompt: str, think: bool, format) -> dict:
         payload = {
             "model": model,
             "messages": [{"role": role, "content": prompt}],
@@ -58,9 +68,18 @@ class OllamaClient:
         if format is not None:
             payload["format"] = format
         response = await self._client.post(f"{self.base_url}/api/chat", json=payload)
-        response.raise_for_status()
-        data = response.json()
-        return data["message"]["content"]
+        if response.status_code != 200:
+            # raise_for_status drops the body, which is where ollama explains why.
+            raise RuntimeError(f"Ollama {response.status_code}: {response.text[:300]}")
+        return response.json()["message"]
+
+    async def complete(self, model: str, role: str, prompt: str, think: bool = False, format=None):
+        return (await self._chat(model, role, prompt, think, format))["content"]
+
+    async def complete_with_thinking(self, model: str, role: str, prompt: str, think: bool = False, format=None):
+        """Same as complete, but also returns the thinking block Ollama puts aside."""
+        message = await self._chat(model, role, prompt, think, format)
+        return message.get("content", ""), message.get("thinking", "") or ""
 
     async def stream(self, model: str, role: str, prompt: str, think: bool = False, format=None):
         payload = {

@@ -2,7 +2,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from pydantic import BaseModel, Field, RootModel, computed_field
+from pydantic import BaseModel, Field, RootModel, computed_field, field_validator
 
 
 class ExpandQueryResponse(BaseModel):
@@ -27,6 +27,34 @@ class WriteAction(BaseModel):
 
 class RunAction(BaseModel):
     command: str
+
+class EditAction(BaseModel):
+    """Anchor-based edit. Line numbers are resolved by the editor, not the model."""
+    file_path: str
+    anchor: str
+    end_anchor: Optional[str] = None
+    occurrence: int = Field(1, ge=1)
+    new_text: str
+
+    @field_validator("anchor", "end_anchor", mode="before")
+    @classmethod
+    def _text_anchor(cls, v):
+        # A model that sends a line number still gets 'Anchor not found: 12',
+        # which names the mistake; rejecting it only says it sent an int.
+        return str(v) if isinstance(v, (int, float)) and not isinstance(v, bool) else v
+
+class FullWriteAction(BaseModel):
+    """Whole-file overwrite. The editor returns the resulting unified diff."""
+    file_path: str
+    content: str
+
+class FreeResponse(BaseModel):
+    # Optional: only reasoning models produce it, so it is never requested.
+    thought: str = ""
+    response: str = ""
+    edit: Optional[EditAction] = None
+    write: Optional[FullWriteAction] = None
+    run: Optional[List[RunAction]] = None
 
 class DoResponse(BaseModel):
     thought: str

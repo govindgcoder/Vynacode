@@ -38,14 +38,24 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
                 "Output ONLY the JSON object, no other text.\n\n"
                 f"CODE BLOCKS:\n{code_xml}"
             )
-            output = await llm.complete(
-                PLANNER_MODEL, "user", prompt, format=BlockSummaries.model_json_schema()
-            )
-            try:
-                parsed = BlockSummaries.model_validate_json(output)
-            except Exception as e:
-                print(f"Error parsing JSON: {e}")
-                print("Raw output:", output)
+            parsed = None
+            retry_prompt = prompt
+            for attempt in range(3):
+                output = await llm.complete(
+                    PLANNER_MODEL, "user", retry_prompt, format=BlockSummaries.model_json_schema()
+                )
+                try:
+                    parsed = BlockSummaries.model_validate_json(output)
+                    break
+                except Exception as e:
+                    print(f"Error parsing JSON (attempt {attempt + 1}/3): {e}")
+                    print("Raw output:", output)
+                    retry_prompt = (
+                        prompt
+                        + f"\n\nPREVIOUS ERROR: {e}\nFix the JSON structure and try again."
+                    )
+            if parsed is None:
+                print("Failed to parse summaries after 3 attempts; skipping this batch.")
                 return
 
             for block in current_batch:

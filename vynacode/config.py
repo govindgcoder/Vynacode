@@ -4,24 +4,24 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Single source of truth for defaults. The module-level constants below and the
-# `config` command's view both read from this, so a default can never drift
-# between what the CLI prints and what the process actually uses.
+# Single source of truth for defaults; the module constants below and the
+# `config` command both read from it, so a default cannot drift from what the
+# process actually uses.
 SETTINGS = {
     "ollama_url": "http://localhost:11434",
     "planner_model": "qwen2.5-coder:1.5b",
     "coder_model": "qwen2.5-coder:1.5b",
     "context_window": 8192,
+    # Must stay equal to client.py's num_predict, which is what actually caps
+    # the model's output.
+    "reserved_output_tokens": 4096,
+    # Fixed prompt overhead: task line, EDIT_HINT, FREE_SHAPE, framing text.
+    "system_prompt_tokens": 2048,
 }
 
 
 def _candidate_paths() -> list[Path]:
-    """Config file locations in precedence order.
-
-    An explicit VYNACODE_CONFIG short-circuits the chain so a single invocation
-    can be pointed at an arbitrary file, which is what makes the file
-    scriptable and testable without touching a real user config.
-    """
+    """Config file locations in precedence order; VYNACODE_CONFIG wins."""
     env = os.environ.get("VYNACODE_CONFIG")
     if env:
         return [Path(env).expanduser()]
@@ -52,8 +52,12 @@ OLLAMA_URL = config_data.get("ollama_url", SETTINGS["ollama_url"])
 PLANNER_MODEL = config_data.get("planner_model", SETTINGS["planner_model"])
 CODER_MODEL = config_data.get("coder_model", SETTINGS["coder_model"])
 CONTEXT_WINDOW = config_data.get("context_window", SETTINGS["context_window"])
+RESERVED_OUTPUT_TOKENS = config_data.get("reserved_output_tokens", SETTINGS["reserved_output_tokens"])
+SYSTEM_PROMPT_TOKENS = config_data.get("system_prompt_tokens", SETTINGS["system_prompt_tokens"])
 TIER = "free"
-TOKEN_BUDGET = 2048
+# What is left for retrieved code. Clamped: a window smaller than the two
+# reserves would otherwise hand _pack_budget a negative budget.
+TOKEN_BUDGET = max(0, CONTEXT_WINDOW - RESERVED_OUTPUT_TOKENS - SYSTEM_PROMPT_TOKENS)
 
 
 def current_settings() -> dict:
@@ -67,11 +71,6 @@ def is_overridden(key: str) -> bool:
 
 def save_config(updates: dict) -> Path:
     """Merge updates into the active config file and return its path.
-
-    Read-modify-write rather than a full rewrite, so a key this build does not
-    know about survives a save. Writes to the user-global file unless a
-    project-local .vynarc or VYNACODE_CONFIG already exists, so setting a model
-    once affects every project unless a repo deliberately pins its own.
     """
     path = config_path()
     data = _read(path) if path.exists() else {}

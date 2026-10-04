@@ -2,17 +2,24 @@
 import asyncio
 import json
 import re #for regex
+import shutil
 import sys
+import tempfile
 from pathlib import Path
 from typing import List, Optional, Tuple
 
 _ROOT = Path(__file__).resolve().parent
 sys.path.insert(0, str(_ROOT / "backend"))
 sys.path.insert(0, str(_ROOT))
+# editor.py and the schema models it needs import via the package path, so the
+# repo root (the parent of the vynacode package) has to be importable too.
+sys.path.insert(0, str(_ROOT.parent))
 
 import typer
 from rich.console import Console
+from rich.panel import Panel
 from rich.prompt import Confirm
+from rich.text import Text
 from pydantic import ValidationError
 
 from database import (
@@ -25,6 +32,8 @@ from parser import parse_python_file
 from client import OllamaClient, own_terms
 from summarizer import summarize_and_store
 from schema import DoResponse, PlanResponse
+from vynacode.backend.editor import AnchorError, apply_action
+from vynacode.backend.schema import FreeResponse
 
 from vynacode.config import (
     CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET, TIER,
@@ -36,6 +45,28 @@ console = Console()
 llm = OllamaClient(base_url=OLLAMA_URL)
 
 MAX_RETRIES = 3
+EDIT_HINT = (
+    "Anchors are matched literally against the file's lines after whitespace\n"
+    "collapsing, so copy them verbatim from the excerpt above WITHOUT the\n"
+    "line-number gutter. anchor must be unique in the file; when it is not, set\n"
+    "occurrence to pick the nth match (1-based). new_text replaces whole lines,\n"
+    "so include their indentation. To replace a run of lines, set anchor to the\n"
+    "first line and end_anchor to the last."
+)
+FREE_SHAPE = (
+    "Output EXACTLY this JSON structure:\n"
+    '{"response": "one line telling the user what changed", '
+    '"edit": {"file_path": "path relative to the repo root", '
+    '"anchor": "first line to replace", "end_anchor": "last line to replace (omit for one line)", '
+    '"occurrence": 1, "new_text": "replacement lines, indentation included"}, '
+    '"write": {"file_path": "path relative to the repo root", "content": "the entire new file"}, '
+    '"run": [{"command": "bash cmd"}]}\n'
+    "edit changes one range inside an existing file; write creates a NEW file.\n"
+    "Never use write on a file that already exists, and never overwrite it.\n"
+    "Never copy the line-number gutter ('   9 | ') into new_text or content.\n"
+    "Use empty lists / omit what you do not need. Never emit a unified\n"
+    "diff. response must be a STRING, not an object. No extra keys. No fluff."
+)
 PATCH_HINT = (
     "Patch must be valid unified diff with headers. Example:\n"
     "--- a/path/to/file.py\n"
@@ -49,12 +80,21 @@ PATCH_HINT = (
     "hunk lines start with ' ', '+' or '-' followed by the bare source line."
 )
 
-async def _llm_json_with_retry(model: str, prompt: str, validator, max_retries: int = MAX_RETRIES):
+async def _llm_json_with_retry(model: str, prompt: str, validator, max_retries: int = MAX_RETRIES, verbose: bool = False):
     """Call LLM with format=json and retry on validation failure."""
     raw_json = ""
     for attempt in range(max_retries):
         try:
-            raw_json = await llm.complete(model, "user", prompt, format="json")
+            if verbose:
+                raw_json, thinking = await llm.complete_with_thinking(
+                    model, "user", prompt, think=True, format="json"
+                )
+                if thinking.strip():
+                    console.print(
+                        Panel(Text(thinking.strip()), title="think", title_align="left", border_style="dim")
+                    )
+            else:
+                raw_json = await llm.complete(model, "user", prompt, format="json")
         except Exception as e:
             console.print(f"[red]LLM call failed (attempt {attempt + 1}/{max_retries}): {e}[/red]")
             if attempt < max_retries - 1:
@@ -91,14 +131,7 @@ _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
 def validate_patch(patch: str, root: Path) -> List[str]:
-    """Check a unified diff's hunks against the real file on disk.
-
-    A small model will happily emit a well-formed diff whose @@ line numbers do
-    not point at the code it claims to edit. Returns a list of human-readable
-    problems; an empty list means the hunks line up. The old side of a hunk
-    (context plus removed lines) must equal the file at that position, which
-    catches both a wrong offset and a wrong line count.
-    """
+    """Check a unified diff's hunks against the real file. Empty list = hunks line up."""
     target = None
     hunks = []
     cur = None
@@ -154,36 +187,134 @@ def validate_patch(patch: str, root: Path) -> List[str]:
     return problems
 
 
-def _execute_coder_result(res: DoResponse, root: Path):
-    """Print-only: display proposed patches/commands, do not apply or execute."""
-    console.print(f"\n[bold cyan]Thought:[/bold cyan] {res.thought}")
-    if res.write:
-        for action in res.write:
-            problems = validate_patch(action.patch, root)
-            if problems:
-                console.print(
-                    f"\n[bold red]Patch for {action.file_path} FAILED validation:[/bold red]")
-                for p in problems:
-                    console.print(f"[red]  - {p}[/red]")
-                console.print("[red]Line numbers are likely wrong; do not apply as-is.[/red]")
-            else:
-                console.print(
-                    f"\n[bold green]Proposed patch for {action.file_path} (validated):[/bold green]")
-            console.print(action.patch)
+def _proposed_diff(root: Path, response: FreeResponse) -> str:
+    """The diff an action would produce, without writing anything.
+
+    apply_action is the only thing that writes, so the preview runs the same
+    resolvers against a throwaway copy in a temp dir instead of a second,
+    possibly divergent, implementation of them.
+    """
+    action = response.edit or response.write
+    with tempfile.TemporaryDirectory() as tmp:
+        shadow = Path(tmp)
+        target = root / action.file_path
+        # file_path may be absolute, and root / "/abs" is that same path, so both
+        # the shadow copy and the preview action need it made relative first.
+        try:
+            rel = target.relative_to(root)
+        except ValueError:
+            rel = Path(action.file_path)
+        dest = shadow / rel
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        if target.exists():
+            shutil.copy2(target, dest)
+        retargeted = action.model_copy(update={"file_path": str(rel)})
+        preview = FreeResponse(edit=retargeted) if response.edit else FreeResponse(write=retargeted)
+        try:
+            return apply_action(shadow, preview)
+        except AnchorError as e:
+            return f"(cannot apply: {e})"
+
+
+def _apply_one(root: Path, label: str, response: FreeResponse) -> bool:
+    """Show the diff, confirm, then apply. False if refused or failed."""
+    action = response.edit or response.write
+    preview = _proposed_diff(root, response)
+    if preview.startswith("(cannot apply"):
+        console.print(f"\n[bold]{label} {action.file_path}[/bold]")
+        console.print(f"[yellow]{preview}[/yellow]")
+        return False
+
+    console.print(f"\n[bold]{label} {action.file_path}[/bold]")
+    console.print(preview)
+
+    # No TTY means no human to answer; declining keeps an unattended run from
+    # writing anything, instead of dying on EOFError mid-pipeline.
+    if not sys.stdin.isatty():
+        console.print("[yellow]Not a terminal: declined automatically.[/yellow]")
+        return False
+
+    if not Confirm.ask("Apply this change?"):
+        console.print("[yellow]Skipped (not applied).[/yellow]")
+        return False
+
+    try:
+        diff = apply_action(root, response)
+    except AnchorError as e:
+        console.print(f"\n[bold red]{label} of {action.file_path} FAILED:[/bold red] {e}")
+        for line_no, text in getattr(e, "candidates", []):
+            console.print(f"[dim]  candidate line {line_no}: {text}[/dim]")
+        return False
+    except (PermissionError, OSError) as e:
+        console.print(f"\n[bold red]{label} of {action.file_path} REFUSED:[/bold red] {e}")
+        return False
+
+    console.print(f"\n[bold green]Applied {label} to {action.file_path}:[/bold green]")
+    console.print(diff)
+    console.print(f"[dim]Previous version saved under .vc/undo/[/dim]")
+    return True
+
+
+def _real_lines(db_path: Path, file_path: str, limit: int = 40) -> str:
+    """A file's real numbered lines, from the same FTS store the context came from."""
+    stem = Path(file_path).stem
+    out: List[str] = []
+    for b in search_code(db_path, stem):
+        if not b["parent_file"].endswith(file_path):
+            continue
+        for i, line in enumerate(b["code"].splitlines()):
+            out.append(f"{b['line_range_start'] + i:>5} | {line}")
+    return "\n".join(out[:limit])
+
+
+async def _apply_with_anchor_retry(
+    res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool
+) -> None:
+    """Apply, and on a failed anchor show the model the real lines and retry once.
+
+    The model copied an anchor from the prompt gutter, or mistyped it; feeding
+    back the file's actual lines is the same retrieval the context came from.
+    """
+    if _execute_coder_result(res, root):
+        return
+    if not res.edit:
+        return
+    lines = _real_lines(db_path, res.edit.file_path)
+    if not lines:
+        return
+    console.print("[dim]Anchor did not match; retrying with the file's real lines...[/dim]")
+    retry_prompt = prompt + (
+        f"\n\nYour anchor for {res.edit.file_path} matched no line. "
+        f"These are that file's real lines:\n{lines}\n"
+        "Copy an anchor character-for-character from them, with no line numbers."
+    )
+    again = await _llm_json_with_retry(
+        CODER_MODEL, retry_prompt, FreeResponse.model_validate_json, verbose=verbose
+    )
+    if again:
+        _execute_coder_result(again, root)
+
+
+def _execute_coder_result(res: FreeResponse, root: Path) -> bool:
+    """Apply the coder's actions. False if an action failed."""
+    ok = True
+    if res.thought:
+        console.print(f"\n[bold cyan]Thought:[/bold cyan] {res.thought}")
+    # One action per call: apply_action reads a single edit or write, so passing
+    # both would silently drop one.
+    if res.edit and not _apply_one(root, "edit", FreeResponse(edit=res.edit)):
+        ok = False
+    if res.write and not _apply_one(root, "write", FreeResponse(write=res.write)):
+        ok = False
     if res.run:
         for action in res.run:
             console.print(f"\n[bold magenta]Proposed command: {action.command}[/bold magenta]")
-    console.print(f"\n[bold green]Response:[/bold green] {res.response}")
+    if res.response:
+        console.print(f"\n[bold green]Response:[/bold green] {res.response}")
+    return ok
 
 def _block_meta(b: dict) -> str:
-    """One metadata line per block: signature, async marker, return type, deps.
-
-    Every part is conditional on purpose. `returns` is NULL on most blocks and
-    `dependencies` is empty for blocks that reference nothing, so rendering them
-    unconditionally would spend context on empty fields in every block.
-    Tolerates both index generations: older rows stored the whole annotation in
-    `name` with no `annotation` key, newer rows split the two.
-    """
+    """One metadata line per block: signature, async marker, return type, deps."""
     kind = "class" if b.get("type") == "class" else ("async def" if b.get("is_async") else "def")
     params = ", ".join(
         p["name"] + (f": {p['annotation']}" if p.get("annotation") else "")
@@ -201,15 +332,7 @@ _GUTTER_PREFIX = 8  # width of f"{n:>5} | " -> 5 number + 1 space + bar + 1 spac
 
 
 def _step_keywords(db_path: Path, step: str, limit: int = 4) -> Tuple[List[str], List[dict]]:
-    """Resolve a plan step into keywords that actually retrieve something.
-
-    The previous rule took the first four words longer than three characters,
-    which for a step like "add a docstring to the parse_params function" yields
-    add/docstring/parse_params/function: three words of prose and one symbol. So
-    candidates are ordered by specificity, an underscore or a longer token first,
-    and each is kept only if it returns blocks. The search is not wasted because
-    these are the same results the caller goes on to use.
-    """
+    """Keywords from a plan step that actually retrieve something, most specific first."""
     keywords: List[str] = []
     blocks: List[dict] = []
     for w in sorted(own_terms(step), key=lambda t: ("_" in t, len(t)), reverse=True):
@@ -223,12 +346,7 @@ def _step_keywords(db_path: Path, step: str, limit: int = 4) -> Tuple[List[str],
 
 
 def _numbered_code(b: dict) -> str:
-    """Prefix each code line with its real file line number.
-
-    The model must otherwise count lines to map the excerpt back to the file,
-    which small models do badly. The gutter is the only reliable way to give it
-    that mapping; PATCH_HINT tells it not to copy the gutter into a hunk.
-    """
+    """Prefix each code line with its real file line number so the model need not count."""
     start = b['line_range_start']
     return "\n".join(
         f"{start + i:>5} | {line}"
@@ -236,21 +354,7 @@ def _numbered_code(b: dict) -> str:
     )
 
 def _pack_budget(blocks: List[dict], budget: int) -> List[dict]:
-    """Cap a multi-keyword result set to a token budget, keeping whole blocks.
-
-    search_code bounds a single query, but _run_coder and _run_multi issue one
-    query per keyword, so it is the aggregate that reaches the prompt. The
-    estimate reuses the 3-bytes-per-token heuristic from Block.token_estimate,
-    measured on the returned code so this needs nothing from the DB layer.
-    A block that does not fit is not merely skipped: it may evict cheaper
-    lower-ranked blocks, because a skipped block is gone for good while the
-    tokens it needed are stranded. Without this, a rank-3 block of 1891 tokens
-    is dropped while 13 smaller blocks occupy 1450 of 2048.
-
-    The gutter is charged here, not in the DB layer, because it exists only when
-    the code is rendered into a prompt. database.py prices raw bytes; without
-    this the budget would silently undercount by the width of the gutter.
-    """
+    """Cap results to a token budget, keeping whole blocks and evicting cheaper ones."""
 
     packed: List[dict] = []
     for b in blocks:
@@ -300,18 +404,7 @@ _EXACT_NAME_BOOST = 1000.0
 
 
 def _fuse(per_keyword: List[Tuple[str, List[dict]]]) -> List[dict]:
-    """Fuse per-keyword result lists into one ranked, deduplicated list.
-
-    Reciprocal rank fusion: each keyword contributes 1/(_RRF_K + rank) to a
-    block, so a block that several keywords agree on outranks one that a single
-    keyword loved. Raw BM25 scores are not comparable across queries with
-    different match counts, so they cannot be summed directly.
-
-    An exact name match is what the caller usually means, so it is lifted above
-    everything else. The boost only has to exceed the most RRF can accrue, which
-    is one full contribution per keyword, so it stays independent of keyword
-    count and corpus size.
-    """
+    """Reciprocal rank fusion; an exact name match outranks everything."""
     scores: dict = {}
     best: dict = {}
     for kw, blocks in per_keyword:
@@ -324,7 +417,7 @@ def _fuse(per_keyword: List[Tuple[str, List[dict]]]) -> List[dict]:
                     scores[key] += _EXACT_NAME_BOOST
     return [best[k] for k in sorted(scores, key=scores.get, reverse=True)]
 
-async def _run_coder(db_path: Path, keywords: List[str], task: str):
+async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: bool = False):
     console.print("[dim]Retrieving context (code)...[/dim]")
     fused = _fuse([(kw, search_code(db_path, kw)) for kw in keywords])
 
@@ -347,23 +440,18 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str):
     prompt = (
         f"Context:\n{context_str}\n\n"
         f"Task: {task}\n\n"
-        f"{PATCH_HINT}\n"
-        "Output EXACTLY this JSON structure:\n"
-        '{"thought": "your reasoning", "response": "summary string for user", '
-        '"write": [{"file_path": "absolute path", "patch": "unified diff with ---/+++ headers"}], '
-        '"run": [{"command": "bash cmd"}]}'
-        "All fields required. response must be a STRING, not an object. "
-        "If no patches/commands, use empty lists. No extra keys. No fluff."
+        f"{EDIT_HINT}\n"
+        f"{FREE_SHAPE}"
     )
 
     console.print("[dim]Thinking...[/dim]")
-    res = await _llm_json_with_retry(CODER_MODEL, prompt, DoResponse.model_validate_json)
+    res = await _llm_json_with_retry(CODER_MODEL, prompt, FreeResponse.model_validate_json, verbose=verbose)
     if res:
-        _execute_coder_result(res, db_path.parent.parent)
+        await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose)
     else:
         console.print("[red]Coder failed to produce valid JSON[/red]")
 
-async def _run_multi(db_path: Path, keywords: List[str], task: str):
+async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False):
     console.print("[dim]Retrieving context (summaries)...[/dim]")
     # search_code, not search_blocks: this list is rendered by _block_meta and
     # _pack_budget, which need deserialised params and the code body. Raw rows
@@ -416,7 +504,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
         )
 
         console.print("[dim]Planning...[/dim]")
-        plan = await _llm_json_with_retry(PLANNER_MODEL, planner_prompt, PlanResponse.model_validate_json)
+        plan = await _llm_json_with_retry(PLANNER_MODEL, planner_prompt, PlanResponse.model_validate_json, verbose=verbose)
         
         if not plan or not plan.steps:
             console.print("[yellow]Planner returned empty steps[/yellow]")
@@ -491,17 +579,12 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str):
             f"Context:\n{step_context}\n\n"
             f"Task: {step}\n\n"
             f"{scope}\n"
-            f"{PATCH_HINT}\n"
-            "Output EXACTLY this JSON structure:\n"
-            '{"thought": "your reasoning", "response": "summary string for user", '
-            '"write": [{"file_path": "absolute path", "patch": "unified diff with ---/+++ headers"}], '
-            '"run": [{"command": "bash cmd"}]}'
-            "All fields required. response must be a STRING, not an object. "
-            "If no patches/commands, use empty lists. No extra keys. No fluff."
+            f"{EDIT_HINT}\n"
+            f"{FREE_SHAPE}"
         )
-        res = await _llm_json_with_retry(CODER_MODEL, coder_prompt, DoResponse.model_validate_json)
+        res = await _llm_json_with_retry(CODER_MODEL, coder_prompt, FreeResponse.model_validate_json, verbose=verbose)
         if res:
-            _execute_coder_result(res, db_path.parent.parent)
+            await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, coder_prompt, verbose)
 
 
 def view_plan(path: Path):
@@ -564,6 +647,7 @@ def index(
 def do(
     message: str = typer.Argument(..., help="Task description in plain English"),
     mode: str = typer.Option("single", help="single (coder JSON) or multi (planner + coder JSON)"),
+    verbose: bool = typer.Option(False, "--verbose", "-v", help="Show the model's <think> blocks"),
 ):
     async def _run_do():
         root = _find_index_root(Path.cwd().resolve())
@@ -578,7 +662,9 @@ def do(
 
         console.print("[dim]Expanding query...[/dim]")
         try:
-            keywords = await llm.expand_query(CODER_MODEL, message)
+            keywords = await llm.expand_query(
+                CODER_MODEL, message, retry=_llm_json_with_retry, verbose=verbose
+            )
         except Exception as e:
             console.print(f"[red]Query expansion failed: {e}[/red]")
             import traceback as _tb
@@ -587,9 +673,9 @@ def do(
         console.print(f"[cyan]Keywords:[/cyan] {', '.join(keywords)}")
 
         if mode == "single":
-            await _run_coder(db_path, keywords, message)
+            await _run_coder(db_path, keywords, message, verbose)
         elif mode == "multi":
-            await _run_multi(db_path, keywords, message)
+            await _run_multi(db_path, keywords, message, verbose)
         else:
             console.print(f"[red]Unknown mode: {mode}. Use 'single' or 'multi'[/red]")
 

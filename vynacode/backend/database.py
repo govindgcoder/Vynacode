@@ -285,6 +285,16 @@ def get_file_hashes(db_path: Path) -> dict[str, str]:
     return {row[0]: row[1] for row in rows} if rows else {}
 
 
+def index_stats(db_path: Path) -> dict:
+    """Counts for `vynacode status`: files, blocks and how many have summaries."""
+    with sqlite3.connect(str(db_path)) as con:
+        files = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        blocks, summarised = con.execute(
+            "SELECT COUNT(*), SUM(summary IS NOT NULL AND summary != '') FROM blocks"
+        ).fetchone()
+    return {"files": files, "blocks": blocks, "summarised": summarised or 0}
+
+
 def ensure_indexed(db_path: Path) -> bool:
     """Check if the index exists."""
     return db_path.exists()

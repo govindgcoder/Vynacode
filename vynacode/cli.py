@@ -5,6 +5,7 @@ import re #for regex
 import shutil
 import sys
 import tempfile
+from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
 
@@ -25,7 +26,7 @@ from pydantic import ValidationError
 from database import (
     init_db, upsert_file_metadata, upsert_block, delete_blocks_for_file,
     write_codebase_json, search_blocks, search_code, get_file_hashes,
-    prune_deleted_files, ensure_indexed, resolve_all_dependencies
+    get_db_paths, index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies
 )
 from walker import walk
 from parser import parse_python_file
@@ -45,6 +46,9 @@ console = Console()
 llm = OllamaClient(base_url=OLLAMA_URL)
 
 MAX_RETRIES = 3
+# Models that answered "does not support thinking". Kept per process so a
+# non-thinking model is only ever asked once, and never gets think sent again.
+_NON_THINKING_MODELS: set[str] = set()
 EDIT_HINT = (
     "Anchors are matched literally against the file's lines after whitespace\n"
     "collapsing, so copy them verbatim from the excerpt above WITHOUT the\n"
@@ -110,9 +114,11 @@ async def _llm_json_with_retry(
 ):
     """Call LLM with format=json and retry on validation failure."""
     # verbose only shows the thinking; it does not enable it.
+    # A model already known to lack thinking mode never gets think sent again.
+    if model in _NON_THINKING_MODELS:
+        think = False
     raw_json = ""
     attempt = 0
-    downgraded = False
     while attempt < max_retries:
         try:
             raw_json, thinking = await llm.complete_with_thinking(
@@ -123,12 +129,15 @@ async def _llm_json_with_retry(
                     Panel(Text(thinking.strip()), title="think", title_align="left", border_style="dim")
                 )
         except Exception as e:
-            # A model without a thinking mode rejects the request outright, so
-            # the level costs nothing to drop and the call has to be repeated.
-            if think and not downgraded and "does not support thinking" in str(e):
+            if think and "does not support thinking" in str(e):
+                # The call did not fail, the request was just malformed for this
+                # model. Drop think and repeat without spending an attempt: the
+                # set entry means the next loop pass can't re-enter this branch.
+                _NON_THINKING_MODELS.add(model)
                 think = False
-                downgraded = True
-                console.print("[yellow]Model does not support thinking; retrying with it off.[/yellow]")
+                console.print(
+                    f"[yellow]{model} has no thinking mode; retrying with thinking off.[/yellow]"
+                )
                 continue
             attempt += 1
             console.print(f"[red]LLM call failed (attempt {attempt}/{max_retries}): {e}[/red]")
@@ -326,18 +335,16 @@ def _rejected(root: Path, res: FreeResponse) -> Optional[str]:
 
 async def _apply_with_anchor_retry(
     res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool
-) -> None:
+) -> bool:
     """Apply, and on a rejected action show the model the file's real lines and retry once."""
     reason = _rejected(root, res)
     if reason is None:
-        _execute_coder_result(res, root)
-        return
+        return _execute_coder_result(res, root)
 
     action = res.write or res.edit
     lines = _real_lines(db_path, action.file_path)
     if not lines:
-        _execute_coder_result(res, root)
-        return
+        return _execute_coder_result(res, root)
 
     console.print(f"[dim]{reason}; retrying against the file's real lines...[/dim]")
     retry_prompt = prompt + (
@@ -350,8 +357,7 @@ async def _apply_with_anchor_retry(
     again = await _llm_json_with_retry(
         CODER_MODEL, retry_prompt, FreeResponse.model_validate_json, verbose=verbose
     )
-    if again:
-        _execute_coder_result(again, root)
+    return _execute_coder_result(again, root) if again else False
 
 
 def _execute_coder_result(res: FreeResponse, root: Path) -> bool:
@@ -506,12 +512,13 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
 
     console.print("[dim]Thinking...[/dim]")
     res = await _llm_json_with_retry(CODER_MODEL, prompt, FreeResponse.model_validate_json, verbose=verbose)
-    if res:
-        await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose)
-    else:
+    if not res:
         console.print("[red]Coder failed to produce valid JSON[/red]")
+        return False
+    return await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose)
 
-async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False):
+async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False) -> bool:
+    applied_any = False
     console.print("[dim]Retrieving context (summaries)...[/dim]")
     # search_code, not search_blocks: this list is rendered by _block_meta and
     # _pack_budget, which need deserialised params and the code body. Raw rows
@@ -568,7 +575,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
         
         if not plan or not plan.steps:
             console.print("[yellow]Planner returned empty steps[/yellow]")
-            return
+            return False
 
         console.print(f"[green]New Plan ({len(plan.steps)} steps):[/green]")
         for i, step in enumerate(plan.steps, 1):
@@ -586,7 +593,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
         confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with this new plan?")
         if not confirmation:
             console.print("[yellow]Plan aborted. View it with: [bold]show plan[/bold][/yellow]")
-            return
+            return False
     else:
         # Plan was loaded
         console.print(f"[green]Loaded Plan ({len(plan.steps)} steps):[/green]")
@@ -596,7 +603,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
         confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with loaded plan?")
         if not confirmation:
             console.print("[yellow]Plan aborted. View it with: [bold]show plan[/bold][/yellow]")
-            return
+            return False
 
     # Execution loop
     for i, step in enumerate(plan.steps, 1):
@@ -644,8 +651,11 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             f"{FREE_SHAPE}"
         )
         res = await _llm_json_with_retry(CODER_MODEL, coder_prompt, FreeResponse.model_validate_json, verbose=verbose)
-        if res:
-            await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, coder_prompt, verbose)
+        if not res:
+            continue
+        if await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, coder_prompt, verbose):
+            applied_any = True
+    return applied_any
 
 
 def view_plan(path: Path):
@@ -704,6 +714,24 @@ def index(
 ):
     asyncio.run(_run_index_pipeline(Path(path).resolve()))
 
+def _record_run(root: Path, task: str, mode: str, applied: bool) -> None:
+    """Append one line to .vc/history.jsonl for `vynacode log`."""
+    entry = {
+        "time": datetime.now().isoformat(timespec="seconds"),
+        "task": task,
+        "mode": mode,
+        "applied": applied,
+    }
+    try:
+        path = root / ".vc" / "history.jsonl"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except OSError as e:
+        # History is a convenience; losing an entry must not fail the run.
+        console.print(f"[yellow]Could not record run history: {e}[/yellow]")
+
+
 @app.command(help="Act on a request: retrieve context, then propose patches and commands.")
 def do(
     message: str = typer.Argument(..., help="Task description in plain English"),
@@ -734,11 +762,16 @@ def do(
         console.print(f"[cyan]Keywords:[/cyan] {', '.join(keywords)}")
 
         if mode == "single":
-            await _run_coder(db_path, keywords, message, verbose)
+            applied = await _run_coder(db_path, keywords, message, verbose)
         elif mode == "multi":
-            await _run_multi(db_path, keywords, message, verbose)
+            applied = await _run_multi(db_path, keywords, message, verbose)
         else:
             console.print(f"[red]Unknown mode: {mode}. Use 'single' or 'multi'[/red]")
+            return
+
+        # Written before the re-index so a crash there still leaves the run
+        # recorded; append-only JSONL so concurrent runs cannot corrupt it.
+        _record_run(root, message, mode, applied)
 
         # Re-index
         console.print("[dim]Re-indexing codebase...[/dim]")
@@ -787,9 +820,39 @@ def show(
         else:
             console.print("[yellow]No codebase.json found.[/yellow]")
 
-@app.command(help="Show run history.")
-def log():
-    console.print("[yellow]Log! to be implemented[/yellow]")
+@app.command(help="Show run history: what was asked, what was applied.")
+def log(
+    limit: int = typer.Option(20, "--limit", "-n", help="How many most recent runs to show"),
+):
+    root = _find_index_root(Path.cwd().resolve())
+    if not root:
+        console.print("[red]Error: No index found. Run 'vynacode index' first.[/red]")
+        return
+    history_path = root / ".vc" / "history.jsonl"
+    if not history_path.exists():
+        console.print("[yellow]No run history yet.[/yellow]")
+        return
+    entries: List[dict] = []
+    with history_path.open("r", encoding="utf-8") as f:
+        # Newest first, so limit caps the tail the user actually reads.
+        for line in reversed(f.readlines()):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                entries.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+            if len(entries) >= limit:
+                break
+    if not entries:
+        console.print("[yellow]No readable run history.[/yellow]")
+        return
+    for e in entries:
+        mark = "[green]ok[/green]" if e.get("applied") else "[red]none[/red]"
+        console.print(
+            f"[dim]{e.get('time', '?')}[/dim]  [cyan]{e.get('mode', '?')}[/cyan]  {mark}  {e.get('task', '')}"
+        )
 
 @app.command(help="Show or update configuration.")
 def config(
@@ -845,7 +908,109 @@ def config(
 
 @app.command(help="Check the environment: Ollama reachability, models, index state.")
 def doctor():
-    console.print("[yellow]Doctor! to be implemented[/yellow]")
+    problems = 0
+
+    async def _run_doctor():
+        nonlocal problems
+        # Config is checked first: every other probe uses the URL it reports,
+        # so a typo there explains all the failures below it.
+        console.print(f"[bold]Ollama[/bold] [dim]{OLLAMA_URL}[/dim]")
+        try:
+            reachable = await llm.ping()
+            installed = await llm.list_models() if reachable else []
+        except Exception as e:
+            console.print(f"  [red]unreachable[/red] [dim]{e}[/dim]")
+            return
+        if not reachable:
+            problems += 1
+            console.print("  [red]unreachable[/red] [dim]is ollama running?[/dim]")
+            return
+        console.print("  [green]reachable[/green]")
+        # Bare name matches a tag: 'qwen2.5-coder' is satisfied by
+        # 'qwen2.5-coder:1.5b', which is how Ollama reports installed models.
+        for label, model in (("coder", CODER_MODEL), ("planner", PLANNER_MODEL)):
+            hit = next((n for n in installed if n == model or n.split(":")[0] == model.split(":")[0]), None)
+            if hit:
+                console.print(f"  [green]ok[/green] {label} model [cyan]{model}[/cyan] [dim]({hit})[/dim]")
+            else:
+                problems += 1
+                console.print(f"  [red]missing[/red] {label} model [cyan]{model}[/cyan] [dim]ollama pull {model}[/dim]")
+
+    asyncio.run(_run_doctor())
+
+    console.print("\n[bold]Index[/bold]")
+    root = _find_index_root(Path.cwd().resolve())
+    if not root:
+        problems += 1
+        console.print("  [red]no index[/red] [dim]run 'vynacode index'[/dim]")
+        return
+    db_path = root / ".vc" / "vcdb.db"
+    if not ensure_indexed(db_path):
+        problems += 1
+        console.print(f"  [red]no database[/red] [dim]{db_path}[/dim]")
+    else:
+        try:
+            stats = index_stats(db_path)
+            console.print(f"  [green]ok[/green] [dim]{root}[/dim]")
+            console.print(
+                f"       {stats['files']} files, {stats['blocks']} blocks, "
+                f"{stats['summarised']} summarised"
+            )
+            # Missing summaries are a warning, not a failure: retrieval still
+            # works off names and code, just with a weaker plan step.
+            if stats["blocks"] and stats["summarised"] < stats["blocks"]:
+                console.print(
+                    f"  [yellow]partial[/yellow] {stats['blocks'] - stats['summarised']} block(s) unindexed for summaries"
+                )
+        except Exception as e:
+            problems += 1
+            console.print(f"  [red]unreadable[/red] [dim]{e}[/dim]")
+
+    raise typer.Exit(1 if problems else 0)
+
+
+@app.command(help="Show index size, models in use and the last plan.")
+def status():
+    root = _find_index_root(Path.cwd().resolve())
+    console.print(f"[bold]Repo[/bold]  [cyan]{root or 'not found (cwd is outside an index)'}[/cyan]")
+
+    console.print("\n[bold]Models[/bold]")
+    for key in ("coder_model", "planner_model"):
+        value = current_settings()[key]
+        origin = "file" if is_overridden(key) else "default"
+        console.print(f"  [bold]{key:<14}[/bold] [cyan]{value}[/cyan] [dim]({origin})[/dim]")
+    console.print(f"  [bold]{'think_level':<14}[/bold] [cyan]{THINK_LEVEL}[/cyan]")
+    console.print(f"  [bold]{'token_budget':<14}[/bold] [cyan]{TOKEN_BUDGET}[/cyan] [dim]({TIER} tier)[/dim]")
+
+    console.print("\n[bold]Index[/bold]")
+    if not root:
+        console.print("  [yellow]not indexed[/yellow]")
+        return
+    db_path = root / ".vc" / "vcdb.db"
+    if not ensure_indexed(db_path):
+        console.print("  [yellow]not indexed[/yellow] [dim]run 'vynacode index'[/dim]")
+        return
+    stats = index_stats(db_path)
+    console.print(f"  [dim]{db_path}[/dim]")
+    console.print(
+        f"  {stats['files']} files, {stats['blocks']} blocks, {stats['summarised']} summarised"
+    )
+    unsummarised = stats["blocks"] - stats["summarised"]
+    if unsummarised:
+        console.print(f"  [yellow]{unsummarised} block(s) still lack summaries[/yellow]")
+
+    console.print("\n[bold]Last plan[/bold]")
+    plan_path = root / "last_plan.json"
+    if not plan_path.exists():
+        console.print("  [yellow]none[/yellow]")
+        return
+    try:
+        with plan_path.open("r", encoding="utf-8") as f:
+            data = json.load(f)
+        steps = data.get("steps") or []
+        console.print(f"  [dim]{len(steps)} step(s) for:[/dim] {data.get('original_prompt', '?')}")
+    except (json.JSONDecodeError, OSError) as e:
+        console.print(f"  [red]unreadable:[/red] {e}")
 
 if __name__ == "__main__":
     app()

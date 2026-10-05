@@ -37,6 +37,12 @@ class OllamaClient:
         except httpx.ConnectError:
             return False
 
+    async def list_models(self) -> List[str]:
+        """Names of locally installed models, for `vynacode doctor`."""
+        response = await self._client.get(f"{self.base_url}/api/tags")
+        response.raise_for_status()
+        return [m.get("name", "") for m in response.json().get("models", [])]
+
     async def expand_query(self, model: str, query: str, retry=None, verbose: bool = False):
         """Generates 10-12 related single-word keywords from a prompt."""
         # Non-thinking: related words need no reasoning, and own_terms already

@@ -17,7 +17,14 @@ SETTINGS = {
     "reserved_output_tokens": 4096,
     # Fixed prompt overhead: task line, EDIT_HINT, FREE_SHAPE, framing text.
     "system_prompt_tokens": 2048,
+    # Effort level, not a token count: an unbounded trace is what makes some
+    # models ruminate past the point of answering.
+    "think_level": "low",
 }
+
+# What Ollama's `think` field accepts. Booleans are listed because they are the
+# documented on/off form; GPT-OSS ignores them and takes only the levels.
+THINK_LEVELS = ("low", "medium", "high", "max", "true", "false")
 
 
 def _candidate_paths() -> list[Path]:
@@ -54,6 +61,11 @@ CODER_MODEL = config_data.get("coder_model", SETTINGS["coder_model"])
 CONTEXT_WINDOW = config_data.get("context_window", SETTINGS["context_window"])
 RESERVED_OUTPUT_TOKENS = config_data.get("reserved_output_tokens", SETTINGS["reserved_output_tokens"])
 SYSTEM_PROMPT_TOKENS = config_data.get("system_prompt_tokens", SETTINGS["system_prompt_tokens"])
+THINK_LEVEL = config_data.get("think_level", SETTINGS["think_level"])
+if THINK_LEVEL not in THINK_LEVELS:
+    # An unknown level makes Ollama reject the whole request, so a typo in the
+    # config file degrades to the default instead of breaking every call.
+    THINK_LEVEL = SETTINGS["think_level"]
 TIER = "free"
 # What is left for retrieved code. Clamped: a window smaller than the two
 # reserves would otherwise hand _pack_budget a negative budget.

@@ -32,12 +32,12 @@ from parser import parse_python_file
 from client import OllamaClient, own_terms
 from summarizer import summarize_and_store
 from schema import DoResponse, PlanResponse
-from vynacode.backend.editor import AnchorError, apply_action
+from vynacode.backend.editor import AnchorError, apply_action, resolve_span
 from vynacode.backend.schema import FreeResponse
 
 from vynacode.config import (
     CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET, TIER,
-    config_path, current_settings, is_overridden, save_config,
+    THINK_LEVEL, THINK_LEVELS, config_path, current_settings, is_overridden, save_config,
 )
 
 app = typer.Typer()
@@ -53,6 +53,24 @@ EDIT_HINT = (
     "so include their indentation. To replace a run of lines, set anchor to the\n"
     "first line and end_anchor to the last."
 )
+YAGNI_HINT = (
+    "Do the smallest change that fully satisfies the task, and nothing else.\n"
+    "Add no file, helper, wrapper, config key, flag, type or test unless the task\n"
+    "asks for that exact thing by name. Do not refactor, rename, reformat or\n"
+    "'tidy' code the task does not touch. No speculative generality, no\n"
+    "abstraction for a single caller, no guard against a case the existing code\n"
+    "already cannot hit. If a task needs one new helper, that is all it gets.\n"
+    "Say in response what you changed and why, in one line, so the user can\n"
+    "check it without reading the diff."
+)
+FILE_RULE = (
+    "Picking the key is a lookup, not a judgement call:\n"
+    "- the file exists -> edit. Always. Even for a one-line or whole-file\n"
+    "  change. A write over an existing file is rejected.\n"
+    "- the file does not exist AND the task asks for a new file -> write.\n"
+    "- you are unsure whether it exists -> assume it exists, and edit.\n"
+    "Emit ONE action: exactly one of edit or write, or none."
+)
 FREE_SHAPE = (
     "Output EXACTLY this JSON structure:\n"
     '{"response": "one line telling the user what changed", '
@@ -61,8 +79,10 @@ FREE_SHAPE = (
     '"occurrence": 1, "new_text": "replacement lines, indentation included"}, '
     '"write": {"file_path": "path relative to the repo root", "content": "the entire new file"}, '
     '"run": [{"command": "bash cmd"}]}\n'
-    "edit changes one range inside an existing file; write creates a NEW file.\n"
-    "Never use write on a file that already exists, and never overwrite it.\n"
+    f"{FILE_RULE}\n"
+    "edit replaces a range of lines inside an existing file, keeping the rest.\n"
+    "To change a whole existing file, still use edit: anchor its first line and\n"
+    "end_anchor its last, and put the entire new body in new_text.\n"
     "Never copy the line-number gutter ('   9 | ') into new_text or content.\n"
     "Use empty lists / omit what you do not need. Never emit a unified\n"
     "diff. response must be a STRING, not an object. No extra keys. No fluff."
@@ -80,24 +100,39 @@ PATCH_HINT = (
     "hunk lines start with ' ', '+' or '-' followed by the bare source line."
 )
 
-async def _llm_json_with_retry(model: str, prompt: str, validator, max_retries: int = MAX_RETRIES, verbose: bool = False):
+async def _llm_json_with_retry(
+    model: str,
+    prompt: str,
+    validator,
+    max_retries: int = MAX_RETRIES,
+    verbose: bool = False,
+    think: bool | str = THINK_LEVEL,
+):
     """Call LLM with format=json and retry on validation failure."""
+    # verbose only shows the thinking; it does not enable it.
     raw_json = ""
-    for attempt in range(max_retries):
+    attempt = 0
+    downgraded = False
+    while attempt < max_retries:
         try:
-            if verbose:
-                raw_json, thinking = await llm.complete_with_thinking(
-                    model, "user", prompt, think=True, format="json"
+            raw_json, thinking = await llm.complete_with_thinking(
+                model, "user", prompt, think=think, format="json"
+            )
+            if verbose and thinking.strip():
+                console.print(
+                    Panel(Text(thinking.strip()), title="think", title_align="left", border_style="dim")
                 )
-                if thinking.strip():
-                    console.print(
-                        Panel(Text(thinking.strip()), title="think", title_align="left", border_style="dim")
-                    )
-            else:
-                raw_json = await llm.complete(model, "user", prompt, format="json")
         except Exception as e:
-            console.print(f"[red]LLM call failed (attempt {attempt + 1}/{max_retries}): {e}[/red]")
-            if attempt < max_retries - 1:
+            # A model without a thinking mode rejects the request outright, so
+            # the level costs nothing to drop and the call has to be repeated.
+            if think and not downgraded and "does not support thinking" in str(e):
+                think = False
+                downgraded = True
+                console.print("[yellow]Model does not support thinking; retrying with it off.[/yellow]")
+                continue
+            attempt += 1
+            console.print(f"[red]LLM call failed (attempt {attempt}/{max_retries}): {e}[/red]")
+            if attempt < max_retries:
                 console.print("[yellow]Retrying...[/yellow]")
                 await asyncio.sleep(1)
                 continue
@@ -105,14 +140,16 @@ async def _llm_json_with_retry(model: str, prompt: str, validator, max_retries: 
         try:
             return validator(raw_json)
         except ValidationError as e:
-            console.print(f"[yellow]Validation error (attempt {attempt + 1}/{max_retries}):[/yellow] {e}")
-            if attempt < max_retries - 1:
+            attempt += 1
+            console.print(f"[yellow]Validation error (attempt {attempt}/{max_retries}):[/yellow] {e}")
+            if attempt < max_retries:
                 console.print("[yellow]Retrying...[/yellow]")
                 prompt += f"\n\nPREVIOUS ERROR: {e}\nFix the JSON structure and try again."
         except Exception as e:
+            attempt += 1
             console.print(f"[red]Parse error: {e}[/red]")
-            if attempt < max_retries - 1:
-                console.print("[yellow]Retrying...[/yellow]")                                                                                                     
+            if attempt < max_retries:
+                console.print("[yellow]Retrying...[/yellow]")
                 prompt += f"\n\nPREVIOUS ERROR: {e}\nFix the JSON and try again."
     console.print(f"[red]Failed after {max_retries} attempts[/red]")
     if raw_json:
@@ -212,7 +249,7 @@ def _proposed_diff(root: Path, response: FreeResponse) -> str:
         preview = FreeResponse(edit=retargeted) if response.edit else FreeResponse(write=retargeted)
         try:
             return apply_action(shadow, preview)
-        except AnchorError as e:
+        except (AnchorError, PermissionError, OSError) as e:
             return f"(cannot apply: {e})"
 
 
@@ -267,26 +304,48 @@ def _real_lines(db_path: Path, file_path: str, limit: int = 40) -> str:
     return "\n".join(out[:limit])
 
 
+def _rejected(root: Path, res: FreeResponse) -> Optional[str]:
+    """Why apply_action would refuse this response, or None if it would apply."""
+    # Catches both verb mistakes before the user has to decline a bad diff.
+    if res.write and (root / res.write.file_path).exists():
+        return f"{res.write.file_path} already exists; use edit to change it"
+    if not res.edit:
+        return None
+
+    action = res.edit
+    target = root / action.file_path
+    if not target.exists():
+        return f"{action.file_path} does not exist; use write to create it"
+    try:
+        with open(target, "r", encoding="utf-8") as f:
+            resolve_span(f.readlines(), action.anchor, action.end_anchor, action.occurrence)
+    except (AnchorError, OSError) as e:
+        return str(e)
+    return None
+
+
 async def _apply_with_anchor_retry(
     res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool
 ) -> None:
-    """Apply, and on a failed anchor show the model the real lines and retry once.
+    """Apply, and on a rejected action show the model the file's real lines and retry once."""
+    reason = _rejected(root, res)
+    if reason is None:
+        _execute_coder_result(res, root)
+        return
 
-    The model copied an anchor from the prompt gutter, or mistyped it; feeding
-    back the file's actual lines is the same retrieval the context came from.
-    """
-    if _execute_coder_result(res, root):
-        return
-    if not res.edit:
-        return
-    lines = _real_lines(db_path, res.edit.file_path)
+    action = res.write or res.edit
+    lines = _real_lines(db_path, action.file_path)
     if not lines:
+        _execute_coder_result(res, root)
         return
-    console.print("[dim]Anchor did not match; retrying with the file's real lines...[/dim]")
+
+    console.print(f"[dim]{reason}; retrying against the file's real lines...[/dim]")
     retry_prompt = prompt + (
-        f"\n\nYour anchor for {res.edit.file_path} matched no line. "
+        f"\n\nYour action for {action.file_path} was rejected: {reason}.\n"
         f"These are that file's real lines:\n{lines}\n"
-        "Copy an anchor character-for-character from them, with no line numbers."
+        f"{FILE_RULE}\n"
+        "Resend ONE action. Copy an anchor character-for-character from the "
+        "lines above, with no line numbers."
     )
     again = await _llm_json_with_retry(
         CODER_MODEL, retry_prompt, FreeResponse.model_validate_json, verbose=verbose
@@ -440,6 +499,7 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
     prompt = (
         f"Context:\n{context_str}\n\n"
         f"Task: {task}\n\n"
+        f"{YAGNI_HINT}\n\n"
         f"{EDIT_HINT}\n"
         f"{FREE_SHAPE}"
     )
@@ -579,6 +639,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             f"Context:\n{step_context}\n\n"
             f"Task: {step}\n\n"
             f"{scope}\n"
+            f"{YAGNI_HINT}\n\n"
             f"{EDIT_HINT}\n"
             f"{FREE_SHAPE}"
         )
@@ -736,6 +797,7 @@ def config(
     planner_model: Optional[str] = typer.Option(None, "--planner-model", "-p", help="Model that plans and summarises"),
     context_window: Optional[int] = typer.Option(None, "--context-window", "-w", help="Model context window, in tokens"),
     ollama_url: Optional[str] = typer.Option(None, "--ollama-url", "-u", help="Ollama base URL"),
+    think_level: Optional[str] = typer.Option(None, "--think-level", "-t", help="Thinking effort: " + ", ".join(THINK_LEVELS)),
 ):
     updates: dict = {}
     if coder_model is not None:
@@ -744,6 +806,13 @@ def config(
         updates["planner_model"] = planner_model
     if ollama_url is not None:
         updates["ollama_url"] = ollama_url
+    if think_level is not None:
+        # Validated here rather than at load time so a typo is reported to the
+        # user, instead of being silently replaced by the default.
+        if think_level not in THINK_LEVELS:
+            console.print(f"[red]Error: --think-level must be one of {', '.join(THINK_LEVELS)}.[/red]")
+            raise typer.Exit(1)
+        updates["think_level"] = think_level
     if context_window is not None:
         # Guards the budget arithmetic rather than the value: a zero or
         # negative window would make every later context cap collapse.

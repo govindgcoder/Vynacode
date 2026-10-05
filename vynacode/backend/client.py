@@ -38,14 +38,15 @@ class OllamaClient:
             return False
 
     async def expand_query(self, model: str, query: str, retry=None, verbose: bool = False):
-        """Generates 10-12 related single-word keywords from a prompt.
-
-        retry is the caller's json-with-retry loop, so a model returning the
-        wrong JSON shape is retried rather than killing the run.
-        """
+        """Generates 10-12 related single-word keywords from a prompt."""
+        # Non-thinking: related words need no reasoning, and own_terms already
+        # covers the literal ones for free.
         prompt = f"Respond with a JSON object with a single key 'keywords' containing a comma-separated list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no spaces within keywords."
         if retry:
-            parsed = await retry(model, prompt, ExpandQueryResponse.model_validate_json, verbose=verbose)
+            parsed = await retry(
+                model, prompt, ExpandQueryResponse.model_validate_json,
+                verbose=verbose, think=False,
+            )
         else:
             parsed = ExpandQueryResponse.model_validate_json(
                 await self.complete(model, "user", prompt, format="json")
@@ -57,11 +58,13 @@ class OllamaClient:
         # drops the literal symbol, so the prompt's own words are searched too.
         return list(dict.fromkeys([*keywords, *own_terms(query)]))
 
-    async def _chat(self, model: str, role: str, prompt: str, think: bool, format) -> dict:
+    async def _chat(self, model: str, role: str, prompt: str, think: bool | str, format) -> dict:
         payload = {
             "model": model,
             "messages": [{"role": role, "content": prompt}],
             "stream": False,
+            # Ollama takes a bool to switch thinking off, or a level
+            # ("minimal".."max") to bound how long it runs. Sent verbatim.
             "think": think,
             "options": {"num_predict": 4096},
         }
@@ -73,15 +76,15 @@ class OllamaClient:
             raise RuntimeError(f"Ollama {response.status_code}: {response.text[:300]}")
         return response.json()["message"]
 
-    async def complete(self, model: str, role: str, prompt: str, think: bool = False, format=None):
+    async def complete(self, model: str, role: str, prompt: str, think: bool | str = False, format=None):
         return (await self._chat(model, role, prompt, think, format))["content"]
 
-    async def complete_with_thinking(self, model: str, role: str, prompt: str, think: bool = False, format=None):
+    async def complete_with_thinking(self, model: str, role: str, prompt: str, think: bool | str = False, format=None):
         """Same as complete, but also returns the thinking block Ollama puts aside."""
         message = await self._chat(model, role, prompt, think, format)
         return message.get("content", ""), message.get("thinking", "") or ""
 
-    async def stream(self, model: str, role: str, prompt: str, think: bool = False, format=None):
+    async def stream(self, model: str, role: str, prompt: str, think: bool | str = False, format=None):
         payload = {
             "model": model,
             "messages": [{"role": role, "content": prompt}],

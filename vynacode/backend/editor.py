@@ -32,6 +32,10 @@ def _strip_gutter(text: str) -> str:
     return _GUTTER.sub("", text)
 
 
+def _line_number(needle: str) -> Optional[int]:
+    return int(needle) if needle.isdigit() else None
+
+
 def _check_containment(root: Path, target: Path):
     """Rejects any resolved path outside the index root."""
     try:
@@ -64,6 +68,12 @@ def resolve_anchor(lines: List[str], needle: str, occurrence: int = 1) -> int:
     if needle == "":
         raise AnchorError("String to search is empty")
 
+    number = _line_number(needle)
+    if number is not None:
+        if not 1 <= number <= len(lines):
+            raise AnchorError(f"Anchor {needle!r} is outside the file (1..{len(lines)})")
+        return number
+
     candidates = [
         (index + 1, line.strip())
         for index, line in enumerate(lines)
@@ -91,6 +101,22 @@ def resolve_span(
     anchor = _normalise(_strip_gutter(anchor))
     if anchor == "":
         raise AnchorError("String to search is empty")
+
+    anchor_number = _line_number(anchor)
+    if anchor_number is not None:
+        if not 1 <= anchor_number <= len(lines):
+            raise AnchorError(f"Anchor {anchor!r} is outside the file (1..{len(lines)})")
+        if end_anchor is None:
+            return (anchor_number, anchor_number)
+        end_anchor = _normalise(_strip_gutter(end_anchor))
+        end_number = _line_number(end_anchor)
+        if end_number is None:
+            raise AnchorError(f"End anchor not found: {end_anchor!r}")
+        if not anchor_number <= end_number <= len(lines):
+            raise AnchorError(
+                f"End anchor {end_anchor!r} is not a line at or after {anchor_number}"
+            )
+        return (anchor_number, end_number)
 
     indexes = [
         index for index, line in enumerate(lines)

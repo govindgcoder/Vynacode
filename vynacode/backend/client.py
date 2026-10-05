@@ -25,6 +25,17 @@ def own_terms(text: str) -> List[str]:
 import httpx
 
 
+def _as_think(think: bool | str) -> bool | str:
+    """Coerce think_level's "true"/"false" strings to JSON literals.
+
+    The config stores levels as strings; Ollama wants bare true/false for on/off
+    and strings only for effort levels. Other levels pass through untouched.
+    """
+    if isinstance(think, str) and think.lower() in ("true", "false"):
+        return think.lower() == "true"
+    return think
+
+
 class OllamaClient:
     def __init__(self, base_url: str = "http://localhost:11434", timeout: float = 300.0):
         self.base_url = base_url
@@ -69,9 +80,7 @@ class OllamaClient:
             "model": model,
             "messages": [{"role": role, "content": prompt}],
             "stream": False,
-            # Ollama takes a bool to switch thinking off, or a level
-            # ("minimal".."max") to bound how long it runs. Sent verbatim.
-            "think": think,
+            "think": _as_think(think),
             "options": {"num_predict": 4096},
         }
         if format is not None:
@@ -95,7 +104,7 @@ class OllamaClient:
             "model": model,
             "messages": [{"role": role, "content": prompt}],
             "stream": True,
-            "think": think,
+            "think": _as_think(think),
             "options": {"num_predict": 4096},
         }
         if format is not None:

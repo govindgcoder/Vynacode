@@ -46,8 +46,7 @@ console = Console()
 llm = OllamaClient(base_url=OLLAMA_URL)
 
 MAX_RETRIES = 3
-# Models that answered "does not support thinking". Kept per process so a
-# non-thinking model is only ever asked once, and never gets think sent again.
+# Models known to lack thinking mode, so the probe happens once per process.
 _NON_THINKING_MODELS: set[str] = set()
 EDIT_HINT = (
     "Anchors are matched literally against the file's lines after whitespace\n"
@@ -130,9 +129,8 @@ async def _llm_json_with_retry(
                 )
         except Exception as e:
             if think and "does not support thinking" in str(e):
-                # The call did not fail, the request was just malformed for this
-                # model. Drop think and repeat without spending an attempt: the
-                # set entry means the next loop pass can't re-enter this branch.
+                # Malformed request, not a model failure: drop think and repeat
+                # without spending an attempt.
                 _NON_THINKING_MODELS.add(model)
                 think = False
                 console.print(
@@ -769,8 +767,7 @@ def do(
             console.print(f"[red]Unknown mode: {mode}. Use 'single' or 'multi'[/red]")
             return
 
-        # Written before the re-index so a crash there still leaves the run
-        # recorded; append-only JSONL so concurrent runs cannot corrupt it.
+        # Before the re-index, so a crash there still records the run.
         _record_run(root, message, mode, applied)
 
         # Re-index
@@ -834,7 +831,7 @@ def log(
         return
     entries: List[dict] = []
     with history_path.open("r", encoding="utf-8") as f:
-        # Newest first, so limit caps the tail the user actually reads.
+        # Newest first, so limit cuts the tail the user actually reads.
         for line in reversed(f.readlines()):
             line = line.strip()
             if not line:
@@ -912,8 +909,7 @@ def doctor():
 
     async def _run_doctor():
         nonlocal problems
-        # Config is checked first: every other probe uses the URL it reports,
-        # so a typo there explains all the failures below it.
+        # First, because every probe below uses the URL it reports.
         console.print(f"[bold]Ollama[/bold] [dim]{OLLAMA_URL}[/dim]")
         try:
             reachable = await llm.ping()
@@ -926,8 +922,7 @@ def doctor():
             console.print("  [red]unreachable[/red] [dim]is ollama running?[/dim]")
             return
         console.print("  [green]reachable[/green]")
-        # Bare name matches a tag: 'qwen2.5-coder' is satisfied by
-        # 'qwen2.5-coder:1.5b', which is how Ollama reports installed models.
+        # Match on bare name: Ollama reports installed models tagged.
         for label, model in (("coder", CODER_MODEL), ("planner", PLANNER_MODEL)):
             hit = next((n for n in installed if n == model or n.split(":")[0] == model.split(":")[0]), None)
             if hit:
@@ -956,8 +951,7 @@ def doctor():
                 f"       {stats['files']} files, {stats['blocks']} blocks, "
                 f"{stats['summarised']} summarised"
             )
-            # Missing summaries are a warning, not a failure: retrieval still
-            # works off names and code, just with a weaker plan step.
+            # Warning, not failure: retrieval still works without summaries.
             if stats["blocks"] and stats["summarised"] < stats["blocks"]:
                 console.print(
                     f"  [yellow]partial[/yellow] {stats['blocks'] - stats['summarised']} block(s) unindexed for summaries"

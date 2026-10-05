@@ -1,0 +1,6 @@
+{
+    "steps": [
+        "Add docstring to _record_run in /home/govind/Projects/Vynacode/vynacode/cli.py"
+    ],
+    "original_prompt": "add a one-line docstring to _record_run in vynacode/cli.py"
+}

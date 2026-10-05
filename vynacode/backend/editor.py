@@ -162,6 +162,7 @@ def apply_action(root: Path, response: FreeResponse) -> str:
         
         _snapshot(root, target_path)
         
+        target_path.parent.mkdir(parents=True, exist_ok=True)
         content = _strip_gutter(action.content)
         with open(target_path, "w", encoding="utf-8") as f:
             f.write(content)

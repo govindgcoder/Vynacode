@@ -285,6 +285,19 @@ def get_file_hashes(db_path: Path) -> dict[str, str]:
     return {row[0]: row[1] for row in rows} if rows else {}
 
 
+def get_unsummarised_files(db_path: Path) -> set[str]:
+    """Files holding at least one block with no summary.
+
+    An unchanged file is skipped by the incremental pass, so a block whose
+    summary failed to generate would otherwise stay empty forever.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT DISTINCT parent_file FROM blocks WHERE summary IS NULL OR summary = ''"
+        ).fetchall()
+    return {row[0] for row in rows if row[0]}
+
+
 def index_stats(db_path: Path) -> dict:
     """Counts for `vynacode status`: files, blocks and how many have summaries."""
     with sqlite3.connect(str(db_path)) as con:

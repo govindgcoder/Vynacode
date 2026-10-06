@@ -4,9 +4,6 @@ from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent
 
-# Single source of truth for defaults; the module constants below and the
-# `config` command both read from it, so a default cannot drift from what the
-# process actually uses.
 SETTINGS = {
     "ollama_url": "http://localhost:11434",
     "planner_model": "qwen2.5-coder:1.5b",
@@ -48,8 +45,6 @@ def _read(path: Path) -> dict:
         with open(path, "r", encoding="utf-8") as f:
             return json.load(f)
     except (json.JSONDecodeError, OSError):
-        # A malformed file must not stop the CLI from starting; the user gets
-        # defaults and can overwrite the bad file with `vynacode config --...`.
         return {}
 
 

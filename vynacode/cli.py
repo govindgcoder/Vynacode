@@ -19,16 +19,17 @@ sys.path.insert(0, str(_ROOT.parent))
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm
+from rich.prompt import Confirm, Prompt
 from rich.text import Text
 from pydantic import ValidationError
 
 from database import (
     init_db, upsert_file_metadata, upsert_block, delete_blocks_for_file,
     write_codebase_json, search_blocks, search_code, get_file_hashes,
-    get_db_paths, index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies
+    get_db_paths, index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies,
+    get_unsummarised_files,
 )
-from walker import walk
+from walker import walk, DEFAULT_VYNAIGNORE
 from parser import parse_python_file
 from client import OllamaClient, own_terms
 from summarizer import summarize_and_store
@@ -673,6 +674,7 @@ async def _run_index_pipeline(dir_path: Path):
     db_path.parent.mkdir(parents=True, exist_ok=True)
     init_db(db_path)
     stored_hashes = get_file_hashes(db_path)
+    unsummarised = get_unsummarised_files(db_path)
     db_paths = set(stored_hashes.keys())
     active_paths: set[str] = set()
 
@@ -680,7 +682,7 @@ async def _run_index_pipeline(dir_path: Path):
         for file_metadata in walk(dir_path):
             str_path = str(file_metadata.path)
             active_paths.add(str_path)
-            if stored_hashes.get(str_path) == file_metadata.hash:
+            if stored_hashes.get(str_path) == file_metadata.hash and str_path not in unsummarised:
                 continue
             upsert_file_metadata(db_path, file_metadata)
             if file_metadata.language == ".py":
@@ -706,11 +708,33 @@ async def _run_index_pipeline(dir_path: Path):
     prune_deleted_files(db_path, dir_path / "codebase.json", stale_paths)
     console.print("[green]Indexing complete.[/green]")
 
+def _ensure_vynaignore(base: Path) -> None:
+    """Offer to create .vynaignore the first time a directory is indexed."""
+    target = base / ".vynaignore"
+    if target.exists():
+        return
+    if not sys.stdin.isatty():
+        return
+    console.print(f"[yellow]No [bold]{target}[/bold] found.[/yellow]")
+    try:
+        content = Prompt.ask(
+            "Ignore patterns (one per line, blank line or Enter to accept)",
+            default=DEFAULT_VYNAIGNORE,
+        )
+    except (EOFError, KeyboardInterrupt):
+        console.print("[yellow]Declined; falling back to the built-in defaults.[/yellow]")
+        return
+    target.write_text(content, encoding="utf-8")
+    console.print(f"[green]Created[/green] {target}")
+
+
 @app.command(help="Index a directory: parse, summarise and store code blocks.")
 def index(
     path: str = typer.Argument(".", help="Directory to index"),
 ):
-    asyncio.run(_run_index_pipeline(Path(path).resolve()))
+    root = Path(path).resolve()
+    _ensure_vynaignore(root)
+    asyncio.run(_run_index_pipeline(root))
 
 def _record_run(root: Path, task: str, mode: str, applied: bool) -> None:
     """Append one line to .vc/history.jsonl for `vynacode log`."""

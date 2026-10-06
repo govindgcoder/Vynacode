@@ -17,6 +17,22 @@ import os
 import pathspec
 from schema import FileMetaData
 
+# Offered by `vynacode index` when a repo has no .vynaignore yet. Matches the
+# entries build_pathspec always adds, so accepting it changes nothing until the
+# user edits it.
+DEFAULT_VYNAIGNORE = (
+    "__pycache__/\n"
+    "*.py[cod]\n"
+    "\n"
+    ".venv/\n"
+    "build/\n"
+    "dist/\n"
+    "\n"
+    ".vynarc\n"
+    "\n"
+    ".python-version\n"
+)
+
 
 def build_pathspec(base: Path):
     files = [".gitignore", ".vynaignore"]

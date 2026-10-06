@@ -16,7 +16,6 @@ class BlockSummaries(BaseModel):
 async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Block], source_code: bytes):
     current_batch: List[Block] = []
     current_tokens = 0
-    update_data = []
 
     no_of_blocks = 0
     total_no = len(blocks)
@@ -54,20 +53,24 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
                         prompt
                         + f"\n\nPREVIOUS ERROR: {e}\nFix the JSON structure and try again."
                     )
+            batch = current_batch
+            current_batch = []
+            current_tokens = 0
             if parsed is None:
+                # This batch only. The next one is independent, and the run moves
+                # on to the following file.
                 print("Failed to parse summaries after 3 attempts; skipping this batch.")
-                return
+                print(f"processed {no_of_blocks}/{total_no} in {batch[0].parent_file}")
+                continue
 
-            for block in current_batch:
+            update_data = []
+            for block in batch:
                 summary = parsed.summaries.get(block.id)
                 if summary:
                     update_data.append((summary, block.id))
 
-            current_batch = []
-            current_tokens = 0
+            if update_data:
+                with sqlite3.connect(db_path) as conn:
+                    conn.executemany("UPDATE blocks SET summary = ? WHERE id = ?", update_data)
 
-            print(f"processed {no_of_blocks}/{total_no} in {block.parent_file}")
-
-    if update_data:
-        with sqlite3.connect(db_path) as conn:
-            conn.executemany("UPDATE blocks SET summary = ? WHERE id = ?", update_data)
+            print(f"processed {no_of_blocks}/{total_no} in {batch[0].parent_file}")

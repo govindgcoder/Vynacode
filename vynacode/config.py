@@ -17,11 +17,16 @@ SETTINGS = {
     # Effort level, not a token count: an unbounded trace is what makes some
     # models ruminate past the point of answering.
     "think_level": "low",
+    # Per-model escape hatch: {model: level}. Model families disagree on the
+    # accepted form -- gpt-oss wants level strings, qwen3/deepseek-r1 booleans,
+    # qwen2.5 nothing -- so one global level cannot fit a mixed planner/coder
+    # pair. An override keyed by model name wins over think_level.
+    "think_overrides": {},
 }
 
 # What Ollama's `think` field accepts. Booleans are listed because they are the
 # documented on/off form; GPT-OSS ignores them and takes only the levels.
-THINK_LEVELS = ("low", "medium", "high", "max", "true", "false")
+THINK_LEVELS = ("low", "medium", "high", "true", "false")
 
 
 def _candidate_paths() -> list[Path]:
@@ -61,6 +66,30 @@ if THINK_LEVEL not in THINK_LEVELS:
     # An unknown level makes Ollama reject the whole request, so a typo in the
     # config file degrades to the default instead of breaking every call.
     THINK_LEVEL = SETTINGS["think_level"]
+def think_for(model: str, role: str | None = None) -> str:
+    """Effective think level: role override, model override, bare-name override, else global.
+
+    Role keys ("coder"/"planner") come first: both roles may share one model,
+    which a model-keyed override cannot differentiate.
+    """
+    settings = current_settings()
+    level = settings["think_level"]
+    if level not in THINK_LEVELS:
+        level = SETTINGS["think_level"]
+    overrides = settings.get("think_overrides")
+    if not isinstance(overrides, dict):
+        return level
+    if role and overrides.get(role) in THINK_LEVELS:
+        return overrides[role]
+    if overrides.get(model) in THINK_LEVELS:
+        return overrides[model]
+    bare = model.split(":", 1)[0]
+    for name, lv in overrides.items():
+        if lv in THINK_LEVELS and name.split(":", 1)[0] == bare:
+            return lv
+    return level
+
+
 TIER = "free"
 # What is left for retrieved code. Clamped: a window smaller than the two
 # reserves would otherwise hand _pack_budget a negative budget.

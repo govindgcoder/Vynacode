@@ -58,15 +58,20 @@ class OllamaClient:
         """Generates 10-12 related single-word keywords from a prompt."""
         # Non-thinking: related words need no reasoning, and own_terms already
         # covers the literal ones for free.
-        prompt = f"Respond with a JSON object with a single key 'keywords' containing a comma-separated list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no spaces within keywords."
+        prompt = (
+            f"Respond with a JSON object with a single key 'keywords' containing a comma-separated "
+            f"list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no "
+            f"spaces within keywords. Repeat verbatim any identifier (function, class, file, "
+            f"variable) the query names."
+        )
         if retry:
             parsed = await retry(
-                model, prompt, ExpandQueryResponse.model_validate_json,
+                model, prompt, ExpandQueryResponse,
                 verbose=verbose, think=False,
             )
         else:
             parsed = ExpandQueryResponse.model_validate_json(
-                await self.complete(model, "user", prompt, format="json")
+                await self.complete(model, "user", prompt, format=ExpandQueryResponse.model_json_schema())
             )
         if parsed is None:
             return list(own_terms(query))

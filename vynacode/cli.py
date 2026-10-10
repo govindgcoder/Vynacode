@@ -21,7 +21,7 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.prompt import Confirm, Prompt
 from rich.text import Text
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 
 from database import (
     init_db, upsert_file_metadata, upsert_block, delete_blocks_for_file,
@@ -29,17 +29,18 @@ from database import (
     get_db_paths, index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies,
     get_unsummarised_files,
 )
-from walker import walk, DEFAULT_VYNAIGNORE
+from walker import walk, compute_sha256, DEFAULT_VYNAIGNORE
 from parser import parse_python_file
 from client import OllamaClient, own_terms
 from summarizer import summarize_and_store
-from schema import DoResponse, PlanResponse
+from schema import DoResponse, FileMetaData, PlanResponse
 from vynacode.backend.editor import AnchorError, apply_action, resolve_span
 from vynacode.backend.schema import FreeResponse
 
 from vynacode.config import (
     CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET, TIER,
-    THINK_LEVEL, THINK_LEVELS, config_path, current_settings, is_overridden, save_config,
+    THINK_LEVELS, config_path, current_settings, is_overridden, save_config,
+    think_for,
 )
 
 app = typer.Typer()
@@ -47,15 +48,19 @@ console = Console()
 llm = OllamaClient(base_url=OLLAMA_URL)
 
 MAX_RETRIES = 3
-# Models known to lack thinking mode, so the probe happens once per process.
-_NON_THINKING_MODELS: set[str] = set()
+# The think value each model actually accepted, so the string->true->false
+# fallback ladder is climbed once per process instead of on every call.
+_SETTLED_THINK: dict[str, bool | str] = {}
+# Models/server combos that reject a response schema get plain format=json.
+_SCHEMALESS_MODELS: set[str] = set()
 EDIT_HINT = (
-    "Anchors are matched literally against the file's lines after whitespace\n"
-    "collapsing, so copy them verbatim from the excerpt above WITHOUT the\n"
-    "line-number gutter. anchor must be unique in the file; when it is not, set\n"
-    "occurrence to pick the nth match (1-based). new_text replaces whole lines,\n"
-    "so include their indentation. To replace a run of lines, set anchor to the\n"
-    "first line and end_anchor to the last."
+    "anchor and end_anchor locate the replaced line(s). Each may be a verbatim\n"
+    "copy of a line from the excerpt above WITHOUT the line-number gutter, or\n"
+    "the bare gutter number itself (e.g. \"41\"); if anchor is a number,\n"
+    "end_anchor must be a number too. Pick whichever you can copy most\n"
+    "reliably. Text anchors match after whitespace collapsing and must be\n"
+    "unique in the file; when not, set occurrence (1-based). new_text replaces\n"
+    "whole lines, so include their indentation."
 )
 YAGNI_HINT = (
     "Do the smallest change that fully satisfies the task, and nothing else.\n"
@@ -88,6 +93,9 @@ FREE_SHAPE = (
     "To change a whole existing file, still use edit: anchor its first line and\n"
     "end_anchor its last, and put the entire new body in new_text.\n"
     "Never copy the line-number gutter ('   9 | ') into new_text or content.\n"
+    "Ground every identifier you emit in the context above: call only functions,\n"
+    "classes and variables that appear there, and keep the file's existing imports.\n"
+    "Check a text anchor appears exactly once in the excerpt before choosing it.\n"
     "Use empty lists / omit what you do not need. Never emit a unified\n"
     "diff. response must be a STRING, not an object. No extra keys. No fluff."
 )
@@ -107,35 +115,61 @@ PATCH_HINT = (
 async def _llm_json_with_retry(
     model: str,
     prompt: str,
-    validator,
+    schema: type[BaseModel],
     max_retries: int = MAX_RETRIES,
     verbose: bool = False,
-    think: bool | str = THINK_LEVEL,
+    think: bool | str | None = None,
 ):
-    """Call LLM with format=json and retry on validation failure."""
+    """Call LLM with schema-constrained JSON and retry on validation failure."""
     # verbose only shows the thinking; it does not enable it.
-    # A model already known to lack thinking mode never gets think sent again.
-    if model in _NON_THINKING_MODELS:
-        think = False
+    # Falsy caller think wins (never rejected); a settled value beats config and
+    # truthy guesses, since re-sending a rejected form re-probes a known 400.
+    if think is None or (think and model in _SETTLED_THINK):
+        think = _SETTLED_THINK.get(model, think_for(model))
+    if isinstance(think, str) and think.lower() in ("true", "false"):
+        think = think.lower() == "true"
+    validate = schema.model_validate_json
+    fmt = "json" if model in _SCHEMALESS_MODELS else schema.model_json_schema()
     raw_json = ""
     attempt = 0
     while attempt < max_retries:
         try:
             raw_json, thinking = await llm.complete_with_thinking(
-                model, "user", prompt, think=think, format="json"
+                model, "user", prompt, think=think, format=fmt
             )
             if verbose and thinking.strip():
                 console.print(
                     Panel(Text(thinking.strip()), title="think", title_align="left", border_style="dim")
                 )
-        except Exception as e:
-            if think and "does not support thinking" in str(e):
-                # Malformed request, not a model failure: drop think and repeat
-                # without spending an attempt.
-                _NON_THINKING_MODELS.add(model)
+            if think and not raw_json.strip() and thinking.strip():
+                # The trace ate the whole num_predict budget (done_reason:
+                # length), leaving no tokens for the answer.
+                _SETTLED_THINK[model] = False
                 think = False
                 console.print(
-                    f"[yellow]{model} has no thinking mode; retrying with thinking off.[/yellow]"
+                    f"[yellow]{model}'s thinking consumed the output budget; retrying with think=False.[/yellow]"
+                )
+                continue
+        except Exception as e:
+            err = str(e).lower()
+            if think and "think" in err:
+                # string -> true -> false; "does not support thinking" means the
+                # capability is absent, so skip the boolean step. No attempt spent.
+                think = (
+                    True
+                    if isinstance(think, str) and "does not support thinking" not in err
+                    else False
+                )
+                _SETTLED_THINK[model] = think
+                console.print(
+                    f"[yellow]{model} rejected that think form; retrying with think={think}.[/yellow]"
+                )
+                continue
+            if fmt != "json" and ("format" in err or "schema" in err):
+                _SCHEMALESS_MODELS.add(model)
+                fmt = "json"
+                console.print(
+                    f"[yellow]{model} rejected the response schema; falling back to format=json.[/yellow]"
                 )
                 continue
             attempt += 1
@@ -146,7 +180,7 @@ async def _llm_json_with_retry(
                 continue
             return None
         try:
-            return validator(raw_json)
+            return validate(raw_json)
         except ValidationError as e:
             attempt += 1
             console.print(f"[yellow]Validation error (attempt {attempt}/{max_retries}):[/yellow] {e}")
@@ -334,16 +368,16 @@ def _rejected(root: Path, res: FreeResponse) -> Optional[str]:
 
 async def _apply_with_anchor_retry(
     res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool
-) -> bool:
-    """Apply, and on a rejected action show the model the file's real lines and retry once."""
+) -> Optional[FreeResponse]:
+    """The response that was applied (the retry's, if one replaced it), else None."""
     reason = _rejected(root, res)
     if reason is None:
-        return _execute_coder_result(res, root)
+        return res if _execute_coder_result(res, root) else None
 
     action = res.write or res.edit
     lines = _real_lines(db_path, action.file_path)
     if not lines:
-        return _execute_coder_result(res, root)
+        return res if _execute_coder_result(res, root) else None
 
     console.print(f"[dim]{reason}; retrying against the file's real lines...[/dim]")
     retry_prompt = prompt + (
@@ -351,12 +385,34 @@ async def _apply_with_anchor_retry(
         f"These are that file's real lines:\n{lines}\n"
         f"{FILE_RULE}\n"
         "Resend ONE action. Copy an anchor character-for-character from the "
-        "lines above, with no line numbers."
+        "lines above, with no line numbers, or give the bare line numbers."
     )
     again = await _llm_json_with_retry(
-        CODER_MODEL, retry_prompt, FreeResponse.model_validate_json, verbose=verbose
+        CODER_MODEL, retry_prompt, FreeResponse, verbose=verbose,
+        think=think_for(CODER_MODEL, "coder"),
     )
-    return _execute_coder_result(again, root) if again else False
+    if again and _execute_coder_result(again, root):
+        return again
+    return None
+
+
+def _refresh_step_files(db_path: Path, res: FreeResponse) -> None:
+    """Re-parse applied files so the next step retrieves post-edit code."""
+    root = db_path.parent.parent
+    for action in (res.edit, res.write):
+        if action is None:
+            continue
+        path = (root / action.file_path).resolve()
+        if path.suffix != ".py" or not path.exists():
+            continue
+        str_path = str(path)
+        # blocks FK to files; a write-created file has no row yet.
+        upsert_file_metadata(db_path, FileMetaData(
+            name=path.name, path=path, language=".py",
+            size_bytes=path.stat().st_size, hash=compute_sha256(path),
+        ))
+        delete_blocks_for_file(db_path, str_path)
+        upsert_block(db_path, str_path, parse_python_file(path))
 
 
 def _execute_coder_result(res: FreeResponse, root: Path) -> bool:
@@ -510,11 +566,14 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
     )
 
     console.print("[dim]Thinking...[/dim]")
-    res = await _llm_json_with_retry(CODER_MODEL, prompt, FreeResponse.model_validate_json, verbose=verbose)
+    res = await _llm_json_with_retry(
+        CODER_MODEL, prompt, FreeResponse, verbose=verbose,
+        think=think_for(CODER_MODEL, "coder"),
+    )
     if not res:
         console.print("[red]Coder failed to produce valid JSON[/red]")
         return False
-    return await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose)
+    return (await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose)) is not None
 
 async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False) -> bool:
     applied_any = False
@@ -557,20 +616,24 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             "Output EXACTLY this JSON structure:\n"
             '{"steps": ["step 1 text", "step 2 text", "..."]}'
             "\n\nCRITICAL: steps MUST be an array of PLAIN STRINGS only. "
-            "NO objects, NO 'instruction' keys, NO 'description' keys, NO code blocks. "
-            "Just plain text strings.\n"
-            "EVERY step MUST name the exact file path and the exact symbol it changes, "
-            "copied from the summaries above, e.g. "
+            "NO objects, NO 'instruction' keys, NO 'description' keys, NO code blocks.\n"
+            "Rules:\n"
+            "- As few steps as the task allows, at most 5.\n"
+            "- EVERY step MUST name the exact file path and the exact symbol it changes, "
+            "copied verbatim from the summaries above, e.g. "
             '"Extend parse_params in vynacode/backend/parser.py to accept keyword-only args". '
-            "Never write a vague step like 'update the parser' or 'add tests': a step "
-            "that names no symbol cannot be located in the codebase.\n"
-            "Order steps so each one is independently applicable, and keep each step to "
-            "a single file where possible.\n"
+            "A step that names no symbol cannot be located in the codebase.\n"
+            "- One file per step. Order steps so earlier edits never invalidate later ones.\n"
+            "- Use only symbols present in the summaries; never invent a name. If the "
+            "change has no matching summary, name the closest file anyway.\n"
             "No fluff. No extra keys. No objects."
         )
 
         console.print("[dim]Planning...[/dim]")
-        plan = await _llm_json_with_retry(PLANNER_MODEL, planner_prompt, PlanResponse.model_validate_json, verbose=verbose)
+        plan = await _llm_json_with_retry(
+            PLANNER_MODEL, planner_prompt, PlanResponse, verbose=verbose,
+            think=think_for(PLANNER_MODEL, "planner"),
+        )
         
         if not plan or not plan.steps:
             console.print("[yellow]Planner returned empty steps[/yellow]")
@@ -649,11 +712,16 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             f"{EDIT_HINT}\n"
             f"{FREE_SHAPE}"
         )
-        res = await _llm_json_with_retry(CODER_MODEL, coder_prompt, FreeResponse.model_validate_json, verbose=verbose)
+        res = await _llm_json_with_retry(
+            CODER_MODEL, coder_prompt, FreeResponse, verbose=verbose,
+            think=think_for(CODER_MODEL, "coder"),
+        )
         if not res:
             continue
-        if await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, coder_prompt, verbose):
+        applied = await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, coder_prompt, verbose)
+        if applied:
             applied_any = True
+            _refresh_step_files(db_path, applied)
     return applied_any
 
 
@@ -882,7 +950,16 @@ def config(
     context_window: Optional[int] = typer.Option(None, "--context-window", "-w", help="Model context window, in tokens"),
     ollama_url: Optional[str] = typer.Option(None, "--ollama-url", "-u", help="Ollama base URL"),
     think_level: Optional[str] = typer.Option(None, "--think-level", "-t", help="Thinking effort: " + ", ".join(THINK_LEVELS)),
+    coder_think: Optional[str] = typer.Option(None, "--coder-think", help="Thinking effort for the coder model only"),
+    planner_think: Optional[str] = typer.Option(None, "--planner-think", help="Thinking effort for the planner model only"),
 ):
+    def _valid_think(value: str, flag: str) -> None:
+        # Validated here rather than at load time so a typo is reported to the
+        # user, instead of being silently replaced by the default.
+        if value not in THINK_LEVELS:
+            console.print(f"[red]Error: {flag} must be one of {', '.join(THINK_LEVELS)}.[/red]")
+            raise typer.Exit(1)
+
     updates: dict = {}
     if coder_model is not None:
         updates["coder_model"] = coder_model
@@ -891,12 +968,18 @@ def config(
     if ollama_url is not None:
         updates["ollama_url"] = ollama_url
     if think_level is not None:
-        # Validated here rather than at load time so a typo is reported to the
-        # user, instead of being silently replaced by the default.
-        if think_level not in THINK_LEVELS:
-            console.print(f"[red]Error: --think-level must be one of {', '.join(THINK_LEVELS)}.[/red]")
-            raise typer.Exit(1)
+        _valid_think(think_level, "--think-level")
         updates["think_level"] = think_level
+    if coder_think is not None or planner_think is not None:
+        # Role keys, not model names: both roles may share one model.
+        overrides = dict(current_settings().get("think_overrides") or {})
+        if coder_think is not None:
+            _valid_think(coder_think, "--coder-think")
+            overrides["coder"] = coder_think
+        if planner_think is not None:
+            _valid_think(planner_think, "--planner-think")
+            overrides["planner"] = planner_think
+        updates["think_overrides"] = overrides
     if context_window is not None:
         # Guards the budget arithmetic rather than the value: a zero or
         # negative window would make every later context cap collapse.
@@ -922,6 +1005,12 @@ def config(
     for key, value in current_settings().items():
         origin = "file" if is_overridden(key) else "default"
         console.print(f"  [bold]{key:<15}[/bold] [cyan]{value}[/cyan]  [dim]({origin})[/dim]")
+
+    console.print("\n[bold]Effective think[/bold]")
+    settled = current_settings()
+    for role in ("coder", "planner"):
+        m = settled[f"{role}_model"]
+        console.print(f"  [bold]{role:<15}[/bold] [cyan]{think_for(m, role)}[/cyan]  [dim]({m})[/dim]")
 
     console.print("\n[bold]Read-only[/bold]")
     console.print(f"  [bold]{'tier':<15}[/bold] [magenta]{TIER}[/magenta]")
@@ -997,7 +1086,9 @@ def status():
         value = current_settings()[key]
         origin = "file" if is_overridden(key) else "default"
         console.print(f"  [bold]{key:<14}[/bold] [cyan]{value}[/cyan] [dim]({origin})[/dim]")
-    console.print(f"  [bold]{'think_level':<14}[/bold] [cyan]{THINK_LEVEL}[/cyan]")
+    for role in ("coder", "planner"):
+        m = current_settings()[f"{role}_model"]
+        console.print(f"  [bold]{'think (' + role + ')':<14}[/bold] [cyan]{think_for(m, role)}[/cyan]")
     console.print(f"  [bold]{'token_budget':<14}[/bold] [cyan]{TOKEN_BUDGET}[/cyan] [dim]({TIER} tier)[/dim]")
 
     console.print("\n[bold]Index[/bold]")

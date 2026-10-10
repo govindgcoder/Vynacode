@@ -31,7 +31,11 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
                 code_xml += f'<block id="{block.id}">\n{code_string}\n</block>\n'
 
             prompt = (
-                "Summarize the functionality of each code block in less than 40 words. "
+                "Summarize each code block in under 40 words for a code search index. "
+                "The index matches summaries word-for-word, so repeat the exact identifiers "
+                "the block defines and calls (functions, classes, methods, key variables, "
+                "modules) verbatim; never paraphrase or omit a name. State what the block "
+                "does and returns, not how. "
                 "Return a JSON object with a single key \"summaries\" whose value is an object "
                 "mapping each block id to its summary. Use the exact block ids provided. "
                 "Output ONLY the JSON object, no other text.\n\n"
@@ -41,7 +45,10 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
             retry_prompt = prompt
             for attempt in range(3):
                 output = await llm.complete(
-                    PLANNER_MODEL, "user", retry_prompt, format=BlockSummaries.model_json_schema()
+                    # Non-thinking: extraction, not reasoning -- a long think
+                    # trace would eat the num_predict budget and truncate the JSON.
+                    PLANNER_MODEL, "user", retry_prompt, think=False,
+                    format=BlockSummaries.model_json_schema(),
                 )
                 try:
                     parsed = BlockSummaries.model_validate_json(output)

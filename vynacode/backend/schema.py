@@ -11,10 +11,6 @@ class ExpandQueryResponse(BaseModel):
 class PlanResponse(BaseModel):
     steps: List[str]
 
-class Parameter(BaseModel):
-    name: str
-    annotation: Optional[str] = None
-
 class Patch(BaseModel):
     file_path: str
     start_line: int
@@ -66,8 +62,7 @@ class Block(BaseModel):
     id: str
     name: Optional[str] = None
     type: Optional[str] = None
-    params: Optional[List[Parameter]] = None
-    returns: Optional[str] = None
+    signature: Optional[str] = None
     line_range: Optional[Tuple[int, int]] = None
     dependencies: Optional[List[str]] = None
     summary: Optional[str] = None
@@ -75,7 +70,6 @@ class Block(BaseModel):
     byte_end: int
     parent_id: Optional[str] = None
     parent_file: Optional[str] = None
-    is_async: bool = False
     chunk_boundary: bool = False
 
     @computed_field

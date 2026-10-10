@@ -19,7 +19,7 @@ sys.path.insert(0, str(_ROOT.parent))
 import typer
 from rich.console import Console
 from rich.panel import Panel
-from rich.prompt import Confirm, Prompt
+from rich.prompt import Confirm
 from rich.text import Text
 from pydantic import BaseModel, ValidationError
 
@@ -29,8 +29,8 @@ from database import (
     get_db_paths, index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies,
     get_unsummarised_files,
 )
-from walker import walk, compute_sha256, DEFAULT_VYNAIGNORE
-from parser import parse_python_file
+from walker import walk, compute_sha256
+from parser import parse_file, SUPPORTED_SUFFIXES
 from client import OllamaClient, own_terms
 from summarizer import summarize_and_store
 from schema import DoResponse, FileMetaData, PlanResponse
@@ -48,68 +48,45 @@ console = Console()
 llm = OllamaClient(base_url=OLLAMA_URL)
 
 MAX_RETRIES = 3
-# The think value each model actually accepted, so the string->true->false
-# fallback ladder is climbed once per process instead of on every call.
 _SETTLED_THINK: dict[str, bool | str] = {}
-# Models/server combos that reject a response schema get plain format=json.
 _SCHEMALESS_MODELS: set[str] = set()
-EDIT_HINT = (
-    "anchor and end_anchor locate the replaced line(s). Each may be a verbatim\n"
-    "copy of a line from the excerpt above WITHOUT the line-number gutter, or\n"
-    "the bare gutter number itself (e.g. \"41\"); if anchor is a number,\n"
-    "end_anchor must be a number too. Pick whichever you can copy most\n"
-    "reliably. Text anchors match after whitespace collapsing and must be\n"
-    "unique in the file; when not, set occurrence (1-based). new_text replaces\n"
-    "whole lines, so include their indentation."
+RULES = (
+    "<rules>\n"
+    "- Do exactly what the task says, nothing more.\n"
+    "- Do not add files, helpers, config keys, or comments.\n"
+    "- Use only names that already appear in the context.\n"
+    "</rules>"
 )
-YAGNI_HINT = (
-    "Do the smallest change that fully satisfies the task, and nothing else.\n"
-    "Add no file, helper, wrapper, config key, flag, type or test unless the task\n"
-    "asks for that exact thing by name. Do not refactor, rename, reformat or\n"
-    "'tidy' code the task does not touch. No speculative generality, no\n"
-    "abstraction for a single caller, no guard against a case the existing code\n"
-    "already cannot hit. If a task needs one new helper, that is all it gets.\n"
-    "Say in response what you changed and why, in one line, so the user can\n"
-    "check it without reading the diff."
+EDIT_HINT = (
+    "<edit>\n"
+    "- anchor: first line to replace. end_anchor: last line (omit if one line).\n"
+    "- Copy lines exactly as shown, without the \"  12 | \" gutter.\n"
+    "- If you cannot copy exact text, use the gutter number alone, e.g. \"12\".\n"
+    "- new_text replaces whole lines; keep their indentation.\n"
+    "- If the text repeats, set occurrence (1-based).\n"
+    "</edit>"
 )
 FILE_RULE = (
-    "Picking the key is a lookup, not a judgement call:\n"
-    "- the file exists -> edit. Always. Even for a one-line or whole-file\n"
-    "  change. A write over an existing file is rejected.\n"
-    "- the file does not exist AND the task asks for a new file -> write.\n"
-    "- you are unsure whether it exists -> assume it exists, and edit.\n"
-    "Emit ONE action: exactly one of edit or write, or none."
+    "<file>\n"
+    "- file exists -> edit.\n"
+    "- file does not exist -> write.\n"
+    "- unsure -> edit.\n"
+    "- Exactly one of edit or write, or neither.\n"
+    "</file>"
 )
 FREE_SHAPE = (
-    "Output EXACTLY this JSON structure:\n"
-    '{"response": "one line telling the user what changed", '
-    '"edit": {"file_path": "path relative to the repo root", '
-    '"anchor": "first line to replace", "end_anchor": "last line to replace (omit for one line)", '
-    '"occurrence": 1, "new_text": "replacement lines, indentation included"}, '
-    '"write": {"file_path": "path relative to the repo root", "content": "the entire new file"}, '
-    '"run": [{"command": "bash cmd"}]}\n'
-    f"{FILE_RULE}\n"
-    "edit replaces a range of lines inside an existing file, keeping the rest.\n"
-    "To change a whole existing file, still use edit: anchor its first line and\n"
-    "end_anchor its last, and put the entire new body in new_text.\n"
-    "Never copy the line-number gutter ('   9 | ') into new_text or content.\n"
-    "Ground every identifier you emit in the context above: call only functions,\n"
-    "classes and variables that appear there, and keep the file's existing imports.\n"
-    "Check a text anchor appears exactly once in the excerpt before choosing it.\n"
-    "Use empty lists / omit what you do not need. Never emit a unified\n"
-    "diff. response must be a STRING, not an object. No extra keys. No fluff."
-)
-PATCH_HINT = (
-    "Patch must be valid unified diff with headers. Example:\n"
-    "--- a/path/to/file.py\n"
-    "+++ b/path/to/file.py\n"
-    "@@ -1,3 +1,4 @@\n"
-    " def foo():\n"
-    "+    \"\"\"Add docstring.\"\"\"\n"
-    "     pass\n"
-    "Context code is shown with a line-number gutter like '   12 | code'.\n"
-    "Use those numbers for the @@ header. Never copy the gutter into the patch;\n"
-    "hunk lines start with ' ', '+' or '-' followed by the bare source line."
+    "<output>\n"
+    "Return ONLY this JSON. No prose, no markdown fences:\n"
+    '{"response": "<one line>", '
+    '"edit": {"file_path": "<path relative to repo root>", "anchor": "<line>", '
+    '"end_anchor": "<line>", "occurrence": 1, "new_text": "<lines>"}, '
+    '"write": {"file_path": "<path relative to repo root>", "content": "<whole file>"}}\n'
+    f"{FILE_RULE}"
+    "Omit keys you do not use. Never emit a unified diff. response is a string.\n"
+    "Example:\n"
+    '{"response": "renamed x to count", "edit": {"file_path": "app/main.py", '
+    '"anchor": "    x = 0", "new_text": "    count = 0"}}\n'
+    "</output>"
 )
 
 async def _llm_json_with_retry(
@@ -381,11 +358,13 @@ async def _apply_with_anchor_retry(
 
     console.print(f"[dim]{reason}; retrying against the file's real lines...[/dim]")
     retry_prompt = prompt + (
-        f"\n\nYour action for {action.file_path} was rejected: {reason}.\n"
-        f"These are that file's real lines:\n{lines}\n"
+        f"\n<retry>\n"
+        f"The action for {action.file_path} was rejected: {reason}.\n"
+        f"Real lines of that file:\n{lines}\n"
         f"{FILE_RULE}\n"
-        "Resend ONE action. Copy an anchor character-for-character from the "
-        "lines above, with no line numbers, or give the bare line numbers."
+        "Resend ONE action. Copy an anchor from the lines above with no line\n"
+        "numbers, or use the bare line number.\n"
+        "</retry>"
     )
     again = await _llm_json_with_retry(
         CODER_MODEL, retry_prompt, FreeResponse, verbose=verbose,
@@ -403,16 +382,16 @@ def _refresh_step_files(db_path: Path, res: FreeResponse) -> None:
         if action is None:
             continue
         path = (root / action.file_path).resolve()
-        if path.suffix != ".py" or not path.exists():
+        if path.suffix not in SUPPORTED_SUFFIXES or not path.exists():
             continue
         str_path = str(path)
         # blocks FK to files; a write-created file has no row yet.
         upsert_file_metadata(db_path, FileMetaData(
-            name=path.name, path=path, language=".py",
+            name=path.name, path=path, language=path.suffix,
             size_bytes=path.stat().st_size, hash=compute_sha256(path),
         ))
         delete_blocks_for_file(db_path, str_path)
-        upsert_block(db_path, str_path, parse_python_file(path))
+        upsert_block(db_path, str_path, parse_file(path))
 
 
 def _execute_coder_result(res: FreeResponse, root: Path) -> bool:
@@ -434,15 +413,8 @@ def _execute_coder_result(res: FreeResponse, root: Path) -> bool:
     return ok
 
 def _block_meta(b: dict) -> str:
-    """One metadata line per block: signature, async marker, return type, deps."""
-    kind = "class" if b.get("type") == "class" else ("async def" if b.get("is_async") else "def")
-    params = ", ".join(
-        p["name"] + (f": {p['annotation']}" if p.get("annotation") else "")
-        for p in (b.get("params") or [])
-    )
-    line = f"{kind} {b['name']}({params})"
-    if b.get("returns"):
-        line += f" -> {b['returns']}"
+    """One metadata line per block: the raw signature plus its dependencies."""
+    line = f"{b.get('type') or 'def'} {b['name']} :: {b.get('signature') or ''}".rstrip()
     deps = [d for d in (b.get("dependencies") or []) if d]
     if deps:
         line += f" | deps: {', '.join(deps)}"
@@ -554,13 +526,13 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
         if b.get('summary'):
             context_str += f"Summary: {b['summary']}\n"
         if b.get('code'):
-            context_str += f"Code:\n```python\n{_numbered_code(b)}```\n"
+            context_str += f"Code:\n```\n{_numbered_code(b)}```\n"
         context_str += "\n"
 
     prompt = (
-        f"Context:\n{context_str}\n\n"
-        f"Task: {task}\n\n"
-        f"{YAGNI_HINT}\n\n"
+        f"<context>\n{context_str}</context>\n\n"
+        f"<task>\n{task}\n</task>\n\n"
+        f"{RULES}\n"
         f"{EDIT_HINT}\n"
         f"{FREE_SHAPE}"
     )
@@ -611,22 +583,21 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
 
     if not plan:
         planner_prompt = (
-            f"Codebase summaries:\n{summary_str}\n\n"
-            f"Task: {task}\n\n"
-            "Output EXACTLY this JSON structure:\n"
-            '{"steps": ["step 1 text", "step 2 text", "..."]}'
-            "\n\nCRITICAL: steps MUST be an array of PLAIN STRINGS only. "
-            "NO objects, NO 'instruction' keys, NO 'description' keys, NO code blocks.\n"
-            "Rules:\n"
-            "- As few steps as the task allows, at most 5.\n"
-            "- EVERY step MUST name the exact file path and the exact symbol it changes, "
-            "copied verbatim from the summaries above, e.g. "
-            '"Extend parse_params in vynacode/backend/parser.py to accept keyword-only args". '
-            "A step that names no symbol cannot be located in the codebase.\n"
-            "- One file per step. Order steps so earlier edits never invalidate later ones.\n"
-            "- Use only symbols present in the summaries; never invent a name. If the "
-            "change has no matching summary, name the closest file anyway.\n"
-            "No fluff. No extra keys. No objects."
+            f"<summaries>\n{summary_str}</summaries>\n\n"
+            f"<task>\n{task}\n</task>\n\n"
+            "<rules>\n"
+            "- Output an ordered list of steps. Each step changes ONE thing.\n"
+            "- A step is ONE file and ONE symbol. Never bundle two changes in a step.\n"
+            "- Name the exact file path and symbol from the summaries, verbatim.\n"
+            "- Ideal maximum: 8 steps; use fewer for a small task.\n"
+            "- Use only symbols present in the summaries. Never invent a name.\n"
+            "</rules>\n"
+            "<output>\n"
+            'Return ONLY {"steps": ["step", "step"]}. Plain strings, no objects, no code.\n'
+            "Example:\n"
+            '{"steps": ["In app/main.py, rename x to count in index", '
+            '"In app/main.py, add a log call in save"]}\n'
+            "</output>"
         )
 
         console.print("[dim]Planning...[/dim]")
@@ -690,13 +661,11 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             if b.get('summary'):
                 step_context += f"Summary: {b['summary']}\n"
             if b.get('code'):
-                step_context += f"Code:\n```python\n{_numbered_code(b)}```\n"
+                step_context += f"Code:\n```\n{_numbered_code(b)}```\n"
             step_context += "\n"
         if not step_context.strip():
             step_context = summary_str
 
-        # Named explicitly so the coder does not have to infer its target from
-        # the excerpt alone, and so it can tell which file a write belongs to.
         step_files = sorted({b['parent_file'] for b in deduped})
         scope = ""
         if step_files:
@@ -705,10 +674,10 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             scope += f"Keywords: {', '.join(step_kws)}\n"
 
         coder_prompt = (
-            f"Context:\n{step_context}\n\n"
-            f"Task: {step}\n\n"
+            f"<context>\n{step_context}</context>\n\n"
+            f"<task>\n{step}\n</task>\n\n"
             f"{scope}\n"
-            f"{YAGNI_HINT}\n\n"
+            f"{RULES}\n"
             f"{EDIT_HINT}\n"
             f"{FREE_SHAPE}"
         )
@@ -753,16 +722,13 @@ async def _run_index_pipeline(dir_path: Path):
             if stored_hashes.get(str_path) == file_metadata.hash and str_path not in unsummarised:
                 continue
             upsert_file_metadata(db_path, file_metadata)
-            if file_metadata.language == ".py":
+            if file_metadata.language in SUPPORTED_SUFFIXES:
                 if str_path in stored_hashes:
                     delete_blocks_for_file(db_path, str_path)
-                blocks = parse_python_file(file_metadata.path)
+                blocks = parse_file(file_metadata.path)
                 upsert_block(db_path, str_path, blocks)
                 with open(file_metadata.path, "rb") as f:
                     file_bytes = f.read()
-                # Blocks are already committed above, so a summarizer failure
-                # (LLM timeout, malformed JSON) must cost only this file's
-                # summaries -- not abort the run and leave a partial index.
                 try:
                     await summarize_and_store(llm, db_path, blocks, source_code=file_bytes)
                 except Exception as e:
@@ -776,32 +742,11 @@ async def _run_index_pipeline(dir_path: Path):
     prune_deleted_files(db_path, dir_path / "codebase.json", stale_paths)
     console.print("[green]Indexing complete.[/green]")
 
-def _ensure_vynaignore(base: Path) -> None:
-    """Offer to create .vynaignore the first time a directory is indexed."""
-    target = base / ".vynaignore"
-    if target.exists():
-        return
-    if not sys.stdin.isatty():
-        return
-    console.print(f"[yellow]No [bold]{target}[/bold] found.[/yellow]")
-    try:
-        content = Prompt.ask(
-            "Ignore patterns (one per line, blank line or Enter to accept)",
-            default=DEFAULT_VYNAIGNORE,
-        )
-    except (EOFError, KeyboardInterrupt):
-        console.print("[yellow]Declined; falling back to the built-in defaults.[/yellow]")
-        return
-    target.write_text(content, encoding="utf-8")
-    console.print(f"[green]Created[/green] {target}")
-
-
 @app.command(help="Index a directory: parse, summarise and store code blocks.")
 def index(
     path: str = typer.Argument(".", help="Directory to index"),
 ):
     root = Path(path).resolve()
-    _ensure_vynaignore(root)
     asyncio.run(_run_index_pipeline(root))
 
 def _record_run(root: Path, task: str, mode: str, applied: bool) -> None:

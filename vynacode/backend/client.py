@@ -59,10 +59,14 @@ class OllamaClient:
         # Non-thinking: related words need no reasoning, and own_terms already
         # covers the literal ones for free.
         prompt = (
-            f"Respond with a JSON object with a single key 'keywords' containing a comma-separated "
-            f"list of 10-12 concise SINGLE-WORD keywords related to: '{query}'. No phrases, no "
-            f"spaces within keywords. Repeat verbatim any identifier (function, class, file, "
-            f"variable) the query names."
+            "<task>List 10-12 SINGLE-WORD keywords to search this codebase for the request.</task>\n"
+            f"<request>{query}</request>\n"
+            "<rules>\n"
+            "- One word per keyword. No spaces, no phrases.\n"
+            "- Copy every identifier the request names, exactly as written.\n"
+            "- Add close synonyms and related type/API words.\n"
+            "</rules>\n"
+            'Output ONLY {"keywords": "word1, word2, word3"}\n'
         )
         if retry:
             parsed = await retry(

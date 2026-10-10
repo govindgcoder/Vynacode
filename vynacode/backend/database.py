@@ -27,8 +27,7 @@ def init_db(db_path: Path):
     id TEXT PRIMARY KEY,
     name TEXT,
     type TEXT,
-    params TEXT,
-    returns TEXT,
+    signature TEXT,
     line_range_start INTEGER,
     line_range_end INTEGER,
     dependencies TEXT,
@@ -36,7 +35,6 @@ def init_db(db_path: Path):
     byte_start INTEGER NOT NULL,
     byte_end INTEGER NOT NULL,
     parent_id TEXT,
-    is_async INTEGER NOT NULL DEFAULT 0, 
     parent_file TEXT,
     chunk_boundary INTEGER NOT NULL DEFAULT 0, 
     FOREIGN KEY (parent_file) REFERENCES files (path) ON  DELETE CASCADE
@@ -47,24 +45,25 @@ def init_db(db_path: Path):
                     CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
                         id UNINDEXED,
                         name,
+                        signature,
                         summary,
                         parent_file,
                         content='blocks',
                         content_rowid='rowid'
                     );
                     CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks BEGIN
-                        INSERT INTO blocks_fts (rowid, id, name, summary, parent_file)
-                        VALUES (new.rowid, new.id, new.name, new.summary, new.parent_file);
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
                     END;
                     CREATE TRIGGER IF NOT EXISTS blocks_ad AFTER DELETE ON blocks BEGIN
-                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, summary, parent_file)
-                        VALUES ('delete', old.rowid, old.id, old.name, old.summary, old.parent_file);
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
                     END;
                     CREATE TRIGGER IF NOT EXISTS blocks_au AFTER UPDATE ON blocks BEGIN
-                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, summary, parent_file)
-                        VALUES ('delete', old.rowid, old.id, old.name, old.summary, old.parent_file);
-                        INSERT INTO blocks_fts (rowid, id, name, summary, parent_file)
-                        VALUES (new.rowid, new.id, new.name, new.summary, new.parent_file);
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
                     END;
                     """)
 
@@ -112,11 +111,7 @@ def _block_result(block: dict) -> dict:
     except OSError:
         code = ''
     return {
-        # Pass the whole row through so search_code never silently drops a
-        # metadata field again; only params/is_async need retyping.
         **block,
-        'is_async': bool(block['is_async']),
-        'params': json.loads(block['params']) if block['params'] else [],
         'dependencies': json.loads(block['dependencies']) if block['dependencies'] else [],
         'code': code,
         'token_estimate': (block['byte_end'] - block['byte_start']) // 3,
@@ -229,18 +224,14 @@ def upsert_block(db_path: Path, parent_file: str, blocks: List[Block]):
         # deleted files accumulated. upsert_file_metadata must run first.
         con.execute("PRAGMA foreign_keys = ON;")
         for block in blocks:
-            params_json = json.dumps(
-                [p.model_dump() for p in block.params] if block.params else []
-            )
             deps_json = json.dumps(block.dependencies if block.dependencies else [])
             con.execute(
-                """INSERT INTO blocks (id, name, type, params, returns, line_range_start, line_range_end, dependencies, summary, byte_start, byte_end, parent_id, is_async, parent_file, chunk_boundary)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """INSERT INTO blocks (id, name, type, signature, line_range_start, line_range_end, dependencies, summary, byte_start, byte_end, parent_id, parent_file, chunk_boundary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                    ON CONFLICT(id) DO UPDATE SET
                        name=excluded.name,
                        type=excluded.type,
-                       params=excluded.params,
-                       returns=excluded.returns,
+                       signature=excluded.signature,
                        line_range_start=excluded.line_range_start,
                        line_range_end=excluded.line_range_end,
                        dependencies=excluded.dependencies,
@@ -248,10 +239,9 @@ def upsert_block(db_path: Path, parent_file: str, blocks: List[Block]):
                        byte_start=excluded.byte_start,
                        byte_end=excluded.byte_end,
                        parent_id=excluded.parent_id,
-                       is_async=excluded.is_async,
                        parent_file=excluded.parent_file,
                        chunk_boundary=excluded.chunk_boundary""",
-                (block.id, block.name, block.type, params_json, block.returns, block.line_range[0], block.line_range[1], deps_json, block.summary, block.byte_start, block.byte_end, block.parent_id, block.is_async, block.parent_file, block.chunk_boundary),
+                (block.id, block.name, block.type, block.signature, block.line_range[0], block.line_range[1], deps_json, block.summary, block.byte_start, block.byte_end, block.parent_id, block.parent_file, block.chunk_boundary),
             )
 
 def write_codebase_json(db_path: Path, codebase_json: Path):

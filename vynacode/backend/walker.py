@@ -17,27 +17,23 @@ import os
 import pathspec
 from schema import FileMetaData
 
-# Offered by `vynacode index` when a repo has no .vynaignore yet. Matches the
-# entries build_pathspec always adds, so accepting it changes nothing until the
-# user edits it.
-DEFAULT_VYNAIGNORE = (
-    "__pycache__/\n"
-    "*.py[cod]\n"
-    "\n"
-    ".venv/\n"
-    "build/\n"
-    "dist/\n"
-    "\n"
-    ".vynarc\n"
-    "\n"
-    ".python-version\n"
-)
+# Applied always, whether or not a project defines .vynaignore. Kept in code
+# rather than written to a file so non-interactive runs (CI) get the same sane
+# default; a project-local file only has to add its own exceptions.
+BUILTIN_IGNORES = [
+    "__pycache__/",
+    "*.py[cod]",
+    ".venv/",
+    "build/",
+    "dist/",
+    ".vynarc",
+    ".python-version",
+]
 
 
 def build_pathspec(base: Path):
-    files = [".gitignore", ".vynaignore"]
-    lines = [".git/", ".vc/", "codebase.json", "codebase.md"]
-    for file in files:
+    lines = [".git/", ".vc/", "codebase.json", "codebase.md", *BUILTIN_IGNORES]
+    for file in (".gitignore", ".vynaignore"):
         path = base / file
         try:
             with open(path, "r") as f:

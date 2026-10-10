@@ -31,15 +31,16 @@ async def summarize_and_store(llm: OllamaClient, db_path: Path, blocks: List[Blo
                 code_xml += f'<block id="{block.id}">\n{code_string}\n</block>\n'
 
             prompt = (
-                "Summarize each code block in under 40 words for a code search index. "
-                "The index matches summaries word-for-word, so repeat the exact identifiers "
-                "the block defines and calls (functions, classes, methods, key variables, "
-                "modules) verbatim; never paraphrase or omit a name. State what the block "
-                "does and returns, not how. "
-                "Return a JSON object with a single key \"summaries\" whose value is an object "
-                "mapping each block id to its summary. Use the exact block ids provided. "
-                "Output ONLY the JSON object, no other text.\n\n"
-                f"CODE BLOCKS:\n{code_xml}"
+                "<task>Write one search-index summary for each code block below.</task>\n"
+                "<rules>\n"
+                "- Under 40 words. Say what it does and returns, not how.\n"
+                "- Repeat the exact identifiers it defines and calls, verbatim.\n"
+                "</rules>\n"
+                "<output>\n"
+                'Return ONLY {"summaries": {"<block id>": "<summary>"}} using the given ids.\n'
+                'Example: {"summaries": {"abc123": "Parses a file into Block objects."}}\n'
+                "</output>\n\n"
+                f"<blocks>\n{code_xml}</blocks>"
             )
             parsed = None
             retry_prompt = prompt

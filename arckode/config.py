@@ -19,11 +19,11 @@ THINK_LEVELS = ("low", "medium", "high", "true", "false")
 
 
 def _candidate_paths() -> list[Path]:
-    """Config file locations in precedence order; VYNACODE_CONFIG wins."""
-    env = os.environ.get("VYNACODE_CONFIG")
+    """Config file locations in precedence order; ARKCODE_CONFIG wins."""
+    env = os.environ.get("ARKCODE_CONFIG")
     if env:
         return [Path(env).expanduser()]
-    return [Path.cwd() / ".vynarc", Path.home() / ".config" / "vynacode" / "config.json"]
+    return [Path.cwd() / ".arkrc", Path.home() / ".config" / "arckode" / "config.json"]
 
 
 def config_path() -> Path:

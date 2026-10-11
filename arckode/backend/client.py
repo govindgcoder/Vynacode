@@ -61,7 +61,7 @@ class OllamaClient:
             return False
 
     async def list_models(self) -> List[str]:
-        """Names of locally installed models, for `vynacode doctor`."""
+        """Names of locally installed models, for `arckode doctor`."""
         response = await self._client.get(f"{self.base_url}/api/tags")
         response.raise_for_status()
         return [m.get("name", "") for m in response.json().get("models", [])]

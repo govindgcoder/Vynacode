@@ -7,14 +7,14 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-# Add the repo root so vynacode package is importable
+# Add the repo root so arckode package is importable
 sys.path.insert(0, str(ROOT))
 
-from vynacode.backend.parser import parse_file
-from vynacode.backend.database import (
+from arckode.backend.parser import parse_file
+from arckode.backend.database import (
     get_paths_by_basename, init_db, load_code, search_blocks,
 )
-from vynacode.cli import (
+from arckode.cli import (
     _correct_file_path, _estimate_block, _fuse, _pack_budget, _real_lines,
 )
 
@@ -126,14 +126,14 @@ def _legacy_db(tmp_path: Path) -> Path:
         con.executescript(_LEGACY_FTS)
         con.execute(
             "INSERT INTO files (path, hash, language, size_bytes)"
-            " VALUES ('/repo/vynacode/cli.py', 'h', '.py', 100)"
+            " VALUES ('/repo/arckode/cli.py', 'h', '.py', 100)"
         )
         con.execute(
             "INSERT INTO blocks (id, name, type, signature, line_range_start,"
             " line_range_end, dependencies, summary, byte_start, byte_end,"
             " parent_file) VALUES ('b1', 'MAX_RETRIES', 'module',"
             " 'MAX_RETRIES = 3', 50, 50, '[]', 'retry budget constant', 0,"
-            " 18, '/repo/vynacode/cli.py')"
+            " 18, '/repo/arckode/cli.py')"
         )
     return db
 
@@ -141,7 +141,7 @@ def _legacy_db(tmp_path: Path) -> Path:
 def test_migration_unindexes_parent_file(tmp_path: Path):
     db = _legacy_db(tmp_path)
     # Poisoned state: the path fragment matches via parent_file alone.
-    assert search_blocks(db, "vynacode")
+    assert search_blocks(db, "arckode")
     init_db(db)
     with sqlite3.connect(str(db)) as con:
         assert con.execute("PRAGMA user_version").fetchone()[0] == 2
@@ -150,7 +150,7 @@ def test_migration_unindexes_parent_file(tmp_path: Path):
         ).fetchone()[0]
     assert "parent_file UNINDEXED" in fts_sql
     # Path words no longer retrieve; content words still do.
-    assert search_blocks(db, "vynacode") == []
+    assert search_blocks(db, "arckode") == []
     hits = search_blocks(db, "MAX_RETRIES")
     assert [h["id"] for h in hits] == ["b1"]
     assert search_blocks(db, "retry") == [hits[0]]

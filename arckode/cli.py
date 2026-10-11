@@ -17,20 +17,20 @@ from rich.prompt import Confirm
 from rich.text import Text
 from pydantic import BaseModel, ValidationError
 
-from vynacode.backend.database import (
+from arckode.backend.database import (
     init_db, upsert_file_metadata, upsert_block, delete_blocks_for_file,
     write_codebase_json, search_blocks, get_file_hashes, get_paths_by_basename,
     index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies,
     get_unsummarised_files, load_code,
 )
-from vynacode.backend.walker import walk, compute_sha256
-from vynacode.backend.parser import parse_file, SUPPORTED_SUFFIXES
-from vynacode.backend.client import OllamaClient, own_terms
-from vynacode.backend.summarizer import summarize_and_store
-from vynacode.backend.schema import FileMetaData, PlanResponse, PlanStep, FreeResponse
-from vynacode.backend.editor import AnchorError, apply_action, resolve_span
+from arckode.backend.walker import walk, compute_sha256
+from arckode.backend.parser import parse_file, SUPPORTED_SUFFIXES
+from arckode.backend.client import OllamaClient, own_terms
+from arckode.backend.summarizer import summarize_and_store
+from arckode.backend.schema import FileMetaData, PlanResponse, PlanStep, FreeResponse
+from arckode.backend.editor import AnchorError, apply_action, resolve_span
 
-from vynacode.config import (
+from arckode.config import (
     CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET, TIER,
     THINK_LEVELS, config_path, current_settings, is_overridden, save_config,
     think_for,
@@ -806,7 +806,7 @@ def index(
     asyncio.run(_run_index_pipeline(root))
 
 def _record_run(root: Path, task: str, mode: str, applied: bool) -> None:
-    """Append one line to .vc/history.jsonl for `vynacode log`."""
+    """Append one line to .vc/history.jsonl for `arckode log`."""
     entry = {
         "time": datetime.now().isoformat(timespec="seconds"),
         "task": task,
@@ -833,12 +833,12 @@ def do(
     async def _run_do():
         root = _find_index_root(Path.cwd().resolve())
         if not root:
-            console.print("[red]Error: No index found. Run 'vynacode index' first.[/red]")
+            console.print("[red]Error: No index found. Run 'arckode index' first.[/red]")
             return
 
         db_path = root / ".vc" / "vcdb.db"
         if not ensure_indexed(db_path):
-            console.print("[red]Error: Index not found. Run 'vynacode index' first.[/red]")
+            console.print("[red]Error: Index not found. Run 'arckode index' first.[/red]")
             return
 
         console.print("[dim]Expanding query...[/dim]")
@@ -917,7 +917,7 @@ def log(
 ):
     root = _find_index_root(Path.cwd().resolve())
     if not root:
-        console.print("[red]Error: No index found. Run 'vynacode index' first.[/red]")
+        console.print("[red]Error: No index found. Run 'arckode index' first.[/red]")
         return
     history_path = root / ".vc" / "history.jsonl"
     if not history_path.exists():
@@ -1052,7 +1052,7 @@ def doctor():
     root = _find_index_root(Path.cwd().resolve())
     if not root:
         problems += 1
-        console.print("  [red]no index[/red] [dim]run 'vynacode index'[/dim]")
+        console.print("  [red]no index[/red] [dim]run 'arckode index'[/dim]")
         return
     db_path = root / ".vc" / "vcdb.db"
     if not ensure_indexed(db_path):
@@ -1099,7 +1099,7 @@ def status():
         return
     db_path = root / ".vc" / "vcdb.db"
     if not ensure_indexed(db_path):
-        console.print("  [yellow]not indexed[/yellow] [dim]run 'vynacode index'[/dim]")
+        console.print("  [yellow]not indexed[/yellow] [dim]run 'arckode index'[/dim]")
         return
     stats = index_stats(db_path)
     console.print(f"  [dim]{db_path}[/dim]")

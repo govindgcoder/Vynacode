@@ -17,21 +17,21 @@ import os
 import pathspec
 from .schema import FileMetaData
 
-# Applied always, whether or not a project defines .vynaignore.
+# Applied always, whether or not a project defines .arkignore.
 BUILTIN_IGNORES = [
     "__pycache__/",
     "*.py[cod]",
     ".venv/",
     "build/",
     "dist/",
-    ".vynarc",
+    ".arkrc",
     ".python-version",
 ]
 
 
 def build_pathspec(base: Path):
     lines = [".git/", ".vc/", "codebase.json", "codebase.md", *BUILTIN_IGNORES]
-    for file in (".gitignore", ".vynaignore"):
+    for file in (".gitignore", ".arkignore"):
         path = base / file
         try:
             with open(path, "r") as f:

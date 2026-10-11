@@ -4,7 +4,7 @@ import difflib
 import re
 from pathlib import Path
 from typing import List, Tuple, Optional
-from vynacode.backend.schema import FreeResponse
+from arckode.backend.schema import FreeResponse
 
 class AnchorError(Exception):
     """Base class for all anchor-related errors."""

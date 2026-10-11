@@ -8,7 +8,7 @@ from typing import List
 from .schema import Block, FileMetaData
 from ..config import TOKEN_BUDGET
 
-# v1 (implicit): blocks_fts indexed parent_file, so path fragments ("vynacode",
+# v1 (implicit): blocks_fts indexed parent_file, so path fragments ("arckode",
 # "cli") matched every block in the project and drowned precise name/summary
 # hits under RRF. v2 unindexes parent_file; file lookup goes through the files
 # table instead (get_paths_by_basename).
@@ -332,7 +332,7 @@ def get_unsummarised_files(db_path: Path) -> set[str]:
 
 
 def index_stats(db_path: Path) -> dict:
-    """Counts for `vynacode status`: files, blocks and how many have summaries."""
+    """Counts for `arckode status`: files, blocks and how many have summaries."""
     with sqlite3.connect(str(db_path)) as con:
         files = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
         blocks, summarised = con.execute(

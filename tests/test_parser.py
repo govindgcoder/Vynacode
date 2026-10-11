@@ -5,10 +5,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-# Add the repo root so vynacode package is importable
+# Add the repo root so arckode package is importable
 sys.path.insert(0, str(ROOT))
 
-from vynacode.backend.parser import SUPPORTED_SUFFIXES, parse_file
+from arckode.backend.parser import SUPPORTED_SUFFIXES, parse_file
 
 
 def _blocks(tmp_path: Path, name: str, source: str):

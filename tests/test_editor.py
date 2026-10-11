@@ -6,7 +6,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from vynacode.backend.editor import (
+from arckode.backend.editor import (
     Ambiguous,
     AnchorError,
     apply_action,
@@ -16,7 +16,7 @@ from vynacode.backend.editor import (
     resolve_span,
     take_snapshot,
 )
-from vynacode.backend.schema import EditAction, FreeResponse, FullWriteAction
+from arckode.backend.schema import EditAction, FreeResponse, FullWriteAction
 
 LINES = ["def alpha():\n", "    return 1\n", "def beta():\n", "    return 2\n"]
 

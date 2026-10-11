@@ -9,23 +9,12 @@ SETTINGS = {
     "planner_model": "qwen2.5-coder:1.5b",
     "coder_model": "qwen2.5-coder:1.5b",
     "context_window": 8192,
-    # Must stay equal to client.py's num_predict, which is what actually caps
-    # the model's output.
     "reserved_output_tokens": 4096,
-    # Fixed prompt overhead: task line, EDIT_HINT, FREE_SHAPE, framing text.
     "system_prompt_tokens": 2048,
-    # Effort level, not a token count: an unbounded trace is what makes some
-    # models ruminate past the point of answering.
     "think_level": "low",
-    # Per-model escape hatch: {model: level}. Model families disagree on the
-    # accepted form -- gpt-oss wants level strings, qwen3/deepseek-r1 booleans,
-    # qwen2.5 nothing -- so one global level cannot fit a mixed planner/coder
-    # pair. An override keyed by model name wins over think_level.
     "think_overrides": {},
 }
 
-# What Ollama's `think` field accepts. Booleans are listed because they are the
-# documented on/off form; GPT-OSS ignores them and takes only the levels.
 THINK_LEVELS = ("low", "medium", "high", "true", "false")
 
 

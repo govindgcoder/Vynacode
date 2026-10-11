@@ -4,13 +4,23 @@ from typing import List
 
 from schema import ExpandQueryResponse
 
-# Summaries are English prose, so a function word matches any block whose
-# summary happens to contain it. Measured: 'the' alone retrieved four unrelated
-# blocks and pushed a real target out of the budget.
 _STOPWORDS = frozenset(
     "a an and are as at be but by for from has have if in into is it its of on "
     "or that the this to was were what when where which who will with you your".split()
 )
+
+# Non-thinking answers are short JSON; a small cap keeps a degenerate trace from
+# spinning and is all the output a well-formed reply needs.
+_MIN_OUTPUT_TOKENS = 1024
+
+
+def _output_budget(prompt: str, thinking: bool | str) -> int:
+    """num_predict derived from the window and prompt, not a fixed constant.
+    """
+    est_prompt = len(prompt) // 3 + 256
+    if thinking:
+        return max(_MIN_OUTPUT_TOKENS, min(RESERVED_OUTPUT_TOKENS, CONTEXT_WINDOW - est_prompt))
+    return _MIN_OUTPUT_TOKENS
 
 
 def own_terms(text: str) -> List[str]:
@@ -23,6 +33,8 @@ def own_terms(text: str) -> List[str]:
     return [w for w in dict.fromkeys(tokens) if not w.isdigit() and w not in _STOPWORDS]
 
 import httpx
+
+from config import CONTEXT_WINDOW, RESERVED_OUTPUT_TOKENS
 
 
 def _as_think(think: bool | str) -> bool | str:
@@ -90,7 +102,13 @@ class OllamaClient:
             "messages": [{"role": role, "content": prompt}],
             "stream": False,
             "think": _as_think(think),
-            "options": {"num_predict": 4096},
+            # num_ctx syncs the served window with config so a raised
+            # context_window actually takes effect without a server restart;
+            # num_predict follows the free window so thinking has room to finish.
+            "options": {
+                "num_predict": _output_budget(prompt, think),
+                "num_ctx": CONTEXT_WINDOW,
+            },
         }
         if format is not None:
             payload["format"] = format
@@ -114,7 +132,10 @@ class OllamaClient:
             "messages": [{"role": role, "content": prompt}],
             "stream": True,
             "think": _as_think(think),
-            "options": {"num_predict": 4096},
+            "options": {
+                "num_predict": _output_budget(prompt, think),
+                "num_ctx": CONTEXT_WINDOW,
+            },
         }
         if format is not None:
             payload["format"] = format

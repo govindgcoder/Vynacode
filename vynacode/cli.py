@@ -119,19 +119,15 @@ async def _llm_json_with_retry(
                     Panel(Text(thinking.strip()), title="think", title_align="left", border_style="dim")
                 )
             if think and not raw_json.strip() and thinking.strip():
-                # The trace ate the whole num_predict budget (done_reason:
-                # length), leaving no tokens for the answer.
-                _SETTLED_THINK[model] = False
                 think = False
                 console.print(
-                    f"[yellow]{model}'s thinking consumed the output budget; retrying with think=False.[/yellow]"
+                    f"[yellow]{model}'s thinking consumed the output budget; "
+                    "retrying this call with think=False.[/yellow]"
                 )
                 continue
         except Exception as e:
             err = str(e).lower()
             if think and "think" in err:
-                # string -> true -> false; "does not support thinking" means the
-                # capability is absent, so skip the boolean step. No attempt spent.
                 think = (
                     True
                     if isinstance(think, str) and "does not support thinking" not in err
@@ -311,13 +307,26 @@ def _apply_one(root: Path, label: str, response: FreeResponse) -> bool:
     return True
 
 
+def _rel(root: Path, path: str) -> str:
+    """Path relative to the repo root; a ragged absolute path is a sibling file
+    beyond root in the CWD's tree (temp dirs, siblings) and must be shown in
+    full or the model cannot address it at all."""
+    try:
+        return str(Path(path).relative_to(root))
+    except ValueError:
+        return path
+
+
 def _real_lines(db_path: Path, file_path: str, limit: int = 40) -> str:
     """A file's real numbered lines, from the same FTS store the context came from."""
     stem = Path(file_path).stem
     out: List[str] = []
+    root = db_path.parent.parent
     for b in search_code(db_path, stem):
         if not b["parent_file"].endswith(file_path):
             continue
+        if not out:
+            out.append(f"--- File: {_rel(root, b['parent_file'])} ---")
         for i, line in enumerate(b["code"].splitlines()):
             out.append(f"{b['line_range_start'] + i:>5} | {line}")
     return "\n".join(out[:limit])
@@ -343,6 +352,22 @@ def _rejected(root: Path, res: FreeResponse) -> Optional[str]:
     return None
 
 
+async def _correct_file_path(db_path: Path, root: Path, file_path: str) -> Optional[str]:
+    """Map a hallucinated path (e.g. app/app.py) onto the unique real file with
+    that basename. None when ambiguous, so we never guess against two files."""
+    path = Path(file_path)
+    real: Optional[str] = None
+    for b in search_code(db_path, path.stem):
+        p = Path(b['parent_file'])
+        if p.name != path.name or not p.is_file():
+            continue
+        rel = _rel(root, str(p))
+        if real is not None and real != rel:
+            return None
+        real = rel
+    return real
+
+
 async def _apply_with_anchor_retry(
     res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool
 ) -> Optional[FreeResponse]:
@@ -350,6 +375,20 @@ async def _apply_with_anchor_retry(
     reason = _rejected(root, res)
     if reason is None:
         return res if _execute_coder_result(res, root) else None
+
+    action = res.write or res.edit
+    # The model can hallucinate a directory in the path (app/app.py after "app"
+    # was a keyword). Retarget onto the real file instead of asking again.
+    if action and not (root / action.file_path).exists():
+        fixed = _correct_file_path(db_path, root, action.file_path)
+        if fixed and fixed != action.file_path:
+            if res.edit:
+                res.edit.file_path = fixed
+            elif res.write:
+                res.write.file_path = fixed
+            reason = _rejected(root, res)
+            if reason is None:
+                return res if _execute_coder_result(res, root) else None
 
     action = res.write or res.edit
     lines = _real_lines(db_path, action.file_path)
@@ -423,17 +462,22 @@ def _block_meta(b: dict) -> str:
 _GUTTER_PREFIX = 8  # width of f"{n:>5} | " -> 5 number + 1 space + bar + 1 space
 
 
-def _step_keywords(db_path: Path, step: str, limit: int = 4) -> Tuple[List[str], List[dict]]:
-    """Keywords from a plan step that actually retrieve something, most specific first."""
+def _step_keywords(db_path: Path, step: str) -> Tuple[List[str], List[dict]]:
+    """Keywords from a plan step that retrieve something, most specific first.
+
+    Dynamic by design: every content word is tried (no fixed 4/8-term ceiling), so
+    multi-symbol steps never lose a file to truncation. The token budget then
+    caps how much code each step carries, not how many words were searched.
+    """
     keywords: List[str] = []
     blocks: List[dict] = []
     for w in sorted(own_terms(step), key=lambda t: ("_" in t, len(t)), reverse=True):
-        if len(keywords) >= limit:
-            break
         hits = search_code(db_path, w)
-        if hits:
+        if not hits:
+            continue
+        if w not in keywords:
             keywords.append(w)
-            blocks.extend(hits)
+        blocks.extend(hits)
     return keywords, blocks
 
 
@@ -520,8 +564,9 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
         console.print(f"[yellow]Budget {TOKEN_BUDGET} tok: kept {len(selected)}/{len(fused)} blocks[/yellow]")
 
     context_str = ""
+    root = db_path.parent.parent
     for b in selected:
-        context_str += f"--- File: {b['parent_file']} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
+        context_str += f"--- File: {_rel(root, b['parent_file'])} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
         context_str += f"{_block_meta(b)}\n"
         if b.get('summary'):
             context_str += f"Summary: {b['summary']}\n"
@@ -549,6 +594,7 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
 
 async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False) -> bool:
     applied_any = False
+    root = db_path.parent.parent
     console.print("[dim]Retrieving context (summaries)...[/dim]")
     # search_code, not search_blocks: this list is rendered by _block_meta and
     # _pack_budget, which need deserialised params and the code body. Raw rows
@@ -557,12 +603,20 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
 
     console.print(f"[cyan]Retrieved {len(fused)} unique blocks from {len(set(b['parent_file'] for b in fused))} files[/cyan]")
 
-    summary_str = ""
-    for b in fused:
-        summary_str += f"- {b['parent_file']}:{b['name']} ({b['line_range_start']}-{b['line_range_end']}): {b['summary']}\n"
+    # Planner sees the real code, not only summaries: with a 16k window the
+    # bodies fit, and body-level tasks (renames, inserts) need the lines to
+    # plan against. Summaries stay for understanding and retrieval, which is
+    # all blocks-without-bodies were ever good for.
+    plan_ctx = ""
+    for b in _pack_budget(fused, TOKEN_BUDGET):
+        plan_ctx += f"--- File: {_rel(root, b['parent_file'])} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
+        plan_ctx += f"{_block_meta(b)}\n"
+        if b.get('summary'):
+            plan_ctx += f"Summary: {b['summary']}\n"
+        plan_ctx += f"Code:\n```\n{_numbered_code(b)}```\n\n"
 
-    root = _find_index_root(Path.cwd().resolve())
-    plan_path = root / "last_plan.json" if root else None
+    plan_dir = _find_index_root(Path.cwd().resolve())
+    plan_path = plan_dir / "last_plan.json" if plan_dir else None
     plan: PlanResponse | None = None
 
     if plan_path and plan_path.exists():
@@ -583,14 +637,14 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
 
     if not plan:
         planner_prompt = (
-            f"<summaries>\n{summary_str}</summaries>\n\n"
+            f"<context>\n{plan_ctx}</context>\n\n"
             f"<task>\n{task}\n</task>\n\n"
-            "<rules>\n"
+"<rules>\n"
             "- Output an ordered list of steps. Each step changes ONE thing.\n"
             "- A step is ONE file and ONE symbol. Never bundle two changes in a step.\n"
-            "- Name the exact file path and symbol from the summaries, verbatim.\n"
+            "- Name the exact file path and symbol from the context, verbatim.\n"
             "- Ideal maximum: 8 steps; use fewer for a small task.\n"
-            "- Use only symbols present in the summaries. Never invent a name.\n"
+            "- Use only symbols present in the context. Never invent a name.\n"
             "</rules>\n"
             "<output>\n"
             'Return ONLY {"steps": ["step", "step"]}. Plain strings, no objects, no code.\n'
@@ -643,7 +697,11 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
         console.print(f"\n[dim]Step {i}/{len(plan.steps)}: {step}[/dim]")
         step_kws, step_blocks = _step_keywords(db_path, step)
         if not step_blocks:
-            step_blocks = fused[:3]
+            # No keyword matched anything: a fallback of arbitrary blocks would
+            # let the coder fabricate context (it did: it rewrote an unrelated
+            # block). Never edit against invented context.
+            console.print(f"[yellow]Step skipped: no matching code in the index for: {step}[/yellow]")
+            continue
             
         seen = set()
         deduped = []
@@ -656,7 +714,7 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
 
         step_context = ""
         for b in _pack_budget(deduped, TOKEN_BUDGET):
-            step_context += f"--- File: {b['parent_file']} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
+            step_context += f"--- File: {_rel(root, b['parent_file'])} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
             step_context += f"{_block_meta(b)}\n"
             if b.get('summary'):
                 step_context += f"Summary: {b['summary']}\n"
@@ -664,12 +722,12 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
                 step_context += f"Code:\n```\n{_numbered_code(b)}```\n"
             step_context += "\n"
         if not step_context.strip():
-            step_context = summary_str
+            step_context = plan_ctx
 
         step_files = sorted({b['parent_file'] for b in deduped})
         scope = ""
         if step_files:
-            scope += f"Files in context: {', '.join(step_files)}\n"
+            scope += f"Files in context: {', '.join(_rel(root, f) for f in step_files)}\n"
         if step_kws:
             scope += f"Keywords: {', '.join(step_kws)}\n"
 

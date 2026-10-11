@@ -7,54 +7,33 @@
 [![Built with Typer](https://img.shields.io/badge/CLI-Typer-009688.svg)](https://typer.tiangolo.com/)
 [![Tree-sitter](https://img.shields.io/badge/parsing-Tree--sitter-FF6B35.svg)](https://tree-sitter.github.io/)
 
-```
-$ arckode index
-Indexing complete. 247 files, 3,891 blocks, 3,891 summarised
+Most local AI coding tools treat your project as a flat wall of text. arcKode doesn’t.
 
-$ arckode do "add structured logging to the parser module"
-Keywords: parser, logging, structured, module, add
+It parses your codebase with Tree-sitter to build a live symbol graph: functions, classes, imports, call edges; then uses that graph to scope what the model actually needs to see. No hallucinated file paths. Just the slice of code that matters for the task.
 
-Planning...
-New Plan (3 steps):
-  1. arckode/backend/parser.py: add structured logging imports
-  2. arckode/backend/parser.py: instrument parse_file with log calls
-  3. arckode/backend/parser.py: add module-level logger configuration
+> You can also input the generated codebase.json as a high level map for other coding agents.
 
-Proceed with this plan? [y/N]: y
+Changes are planned as an ordered edit sequence across files, applied as targeted patches against anchored positions in live source. 
 
-Step 1/3: arckode/backend/parser.py: add structured logging imports
---- File: arckode/backend/parser.py | Range: 1-15 ---
-import logging
-...
-Applied edit to arckode/backend/parser.py
+The whole loop runs locally (LLMs exposed via `ollama serve`). No data leaves your machine. 
 
-Step 2/3: arckode/backend/parser.py: instrument parse_file with log calls
---- File: arckode/backend/parser.py | Range: 47-62 ---
-    logger.info("Parsing %s", path)
-...
-Applied edit to arckode/backend/parser.py
+arcKode works with any Ollama-compatible model; qwen2.5-coder:7b is the recommended default tho.
 
-Step 3/3: arckode/backend/parser.py: add module-level logger configuration
---- File: arckode/backend/parser.py | Range: 15-18 ---
-logger = logging.getLogger(__name__)
-...
-Applied edit to arckode/backend/parser.py
+#### example:
 
-Re-indexing codebase...
-Indexing complete.
-```
+<img width="704" height="784" alt="generated-html" src="https://github.com/user-attachments/assets/1efbb41e-5e3d-4603-b422-05c42c877ef4" />
+
 
 ---
 
-## Core Value Proposition
+## Features
 
-- **Zero external dependencies** — Runs entirely on local models via Ollama; no API keys, no cloud calls, no data leaves your machine
-- **Semantic code understanding** — Tree-sitter parsing across 11 languages produces precise symbol-level blocks with signatures, dependencies, and summaries
-- **Token-aware context packing** — Reciprocal-rank fusion with exact-name boosting fits maximum signal into a fixed token budget
-- **Two-mode operation** — Single-shot edits for surgical changes; multi-step planner+coder for complex refactors with confirmation at each step
-- **Built-in safety** — Automatic snapshots before every write, anchored edits with occurrence control, path containment checks
-- **Incremental indexing** — SHA-256 change detection re-processes only modified files; summaries persist across runs
-- **Transparent reasoning** — Optional model thinking traces visible in-terminal; full run history logged for auditability
+* **Zero external dependencies**: Runs entirely on local models via Ollama; no API keys, no cloud calls, no data leaves your machine
+* **Semantic code understanding**: Tree-sitter parsing across 11 languages produces precise symbol-level blocks with signatures, dependencies, and summaries
+* **Token-aware context packing**: Reciprocal-rank fusion with exact-name boosting fits maximum signal into a fixed token budget
+* **Two-mode operation**: Single-shot edits for surgical changes; multi-step planner+coder for complex refactors with confirmation at each step
+* **Built-in safety**: Automatic snapshots before every write, anchored edits with occurrence control, path containment checks
+* **Incremental indexing**: SHA-256 change detection re-processes only modified files; summaries persist across runs
 
 ---
 
@@ -64,14 +43,14 @@ Indexing complete.
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/your-org/arckode.git
-cd arckode
+git clone [https://github.com/govindgcoder/arcKode.git](https://github.com/govindgcoder/arcKode.git)
+cd arcKode
 
 # 2. Install runtime dependencies
 uv sync
 
 # 3. Pull required models (one-time)
-ollama pull qwen2.5-coder:1.5b
+ollama pull qwen2.5-coder:7b
 
 # 4. Install as a tool
 uv tool install .
@@ -80,9 +59,10 @@ uv tool install .
 cd /path/to/your/project
 arckode index
 arckode do "your task description here"
+
 ```
 
-> **Note:** The `uv tool install .` step is intentional friction — it ensures you run the exact code you audited.
+> **Note:** The `uv tool install .` step is intentional friction: it ensures you run the exact code you audited.
 
 ---
 
@@ -92,18 +72,21 @@ arckode do "your task description here"
 
 ```bash
 arckode do "rename the variable 'count' to 'total' in utils/metrics.py"
+
 ```
 
 ### Intermediate: Cross-file refactor with planning
 
 ```bash
 arckode do "extract the validation logic from handlers/auth.py into a new validators/auth.py module"
+
 ```
 
 ### Advanced: Multi-step feature with auto-confirm
 
 ```bash
 arckode do "add request ID middleware and thread it through the logging context" --mode multi --yes
+
 ```
 
 ### Inspect the index
@@ -117,6 +100,7 @@ arckode show context --query "authenticate"
 
 # Full codebase JSON export
 arckode show index
+
 ```
 
 ### Configuration
@@ -126,10 +110,11 @@ arckode show index
 arckode config
 
 # Override models
-arckode config --coder-model "deepseek-coder:6.7b" --planner-model "qwen2.5:7b"
+arckode config --planner-model "qwen3.5:4b"
 
 # Adjust thinking effort
 arckode config --think-level high
+
 ```
 
 ---
@@ -138,34 +123,36 @@ arckode config --think-level high
 
 ```
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  User Request   │────▶│  Query Expansion │────▶│  Keyword Search │
+│  User Request   │────▶│ Query Expansion  │────▶│ Keyword Search  │
 └─────────────────┘     └──────────────────┘     └────────┬────────┘
                                                           │
                                                           ▼
 ┌─────────────────┐     ┌──────────────────┐     ┌─────────────────┐
-│  Apply Changes  │◀────│  Coder Model     │◀────│  Context Packer │
-│  (anchored,     │     │  (JSON patches)  │     │  (RRF + budget) │
+│  Apply Changes  │◀────│   Coder Model    │◀────│ Context Packer  │
+│  (anchored,     │     │  (JSON patches)  │     │ (RRF + budget)  │
 │   snapshots)    │     └──────────────────┘     └─────────────────┘
 └────────┬────────┘
          │
          ▼
 ┌─────────────────┐
-│  Re-index       │
+│    Re-index     │
 │  (incremental)  │
 └─────────────────┘
+
 ```
 
 **Index structure** (`.vc/vcdb.db`):
-- `files` — path, hash, language, size, imports
-- `blocks` — symbol metadata, byte ranges, dependencies, summaries
-- `blocks_fts` — FTS5 full-text search (parent_file unindexed)
+
+* `files`: path, hash, language, size, imports
+* `blocks`: symbol metadata, byte ranges, dependencies, summaries
+* `blocks_fts`: FTS5 full-text search (parent_file unindexed)
 
 ---
 
 ## Supported Languages
 
 | Language | Extensions | Parser |
-|----------|------------|--------|
+| --- | --- | --- |
 | Python | `.py` | tree-sitter-python |
 | JavaScript | `.js` | tree-sitter-javascript |
 | TypeScript | `.ts`, `.tsx` | tree-sitter-typescript |
@@ -197,6 +184,7 @@ Configuration file locations (precedence order):
   "think_level": "low",
   "think_overrides": {}
 }
+
 ```
 
 **Token budget** = `context_window - reserved_output_tokens - system_prompt_tokens` (default 2048)
@@ -205,4 +193,8 @@ Configuration file locations (precedence order):
 
 ## License
 
-AGPL-3.0-only — see [LICENSE](LICENSE) for details.
+AGPL-3.0-only: see [LICENSE](https://www.google.com/search?q=LICENSE) for details.
+
+```
+
+```

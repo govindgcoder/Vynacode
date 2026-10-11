@@ -92,12 +92,14 @@ def resolve_anchor(lines: List[str], needle: str, occurrence: int = 1) -> int:
     return candidates[occurrence - 1][0]
 
 def resolve_span(
-    lines: List[str], 
-    anchor: str, 
+    lines: List[str],
+    anchor: str,
     end_anchor: Optional[str] = None,
     occurrence: int = 1,
+    line_count: int = 1,
 ) -> Tuple[int, int]:
-    """1-based inclusive (start, end). end_anchor is searched from the anchor down."""
+    """1-based inclusive (start, end). Prefer line_count; fallback to end_anchor.
+    """
     anchor = _normalise(_strip_gutter(anchor))
     if anchor == "":
         raise AnchorError("String to search is empty")
@@ -106,8 +108,9 @@ def resolve_span(
     if anchor_number is not None:
         if not 1 <= anchor_number <= len(lines):
             raise AnchorError(f"Anchor {anchor!r} is outside the file (1..{len(lines)})")
-        if end_anchor is None:
-            return (anchor_number, anchor_number)
+        if end_anchor is None or line_count > 1:
+            return (anchor_number, anchor_number + line_count - 1)
+        # legacy: end_anchor provided and line_count == 1
         end_anchor = _normalise(_strip_gutter(end_anchor))
         end_number = _line_number(end_anchor)
         if end_number is None:
@@ -135,8 +138,8 @@ def resolve_span(
 
     start = indexes[occurrence - 1]
 
-    if end_anchor is None:
-        return (start + 1, start + 1)
+    if end_anchor is None or line_count > 1:
+        return (start + 1, start + line_count)
 
     end_anchor = _normalise(_strip_gutter(end_anchor))
     if end_anchor == "":
@@ -169,7 +172,13 @@ def apply_action(root: Path, response: FreeResponse) -> str:
         with open(target_path, "r", encoding="utf-8") as f:
             old_lines = f.readlines()
 
-        start, end = resolve_span(old_lines, action.anchor, action.end_anchor, action.occurrence)
+        start, end = resolve_span(
+            old_lines, 
+            action.anchor, 
+            line_count=action.line_count, 
+            end_anchor=action.end_anchor, 
+            occurrence=action.occurrence
+        )
         new_lines = apply_edit(old_lines, start, end, action.new_text)
         
         _snapshot(root, target_path)

@@ -1,20 +1,14 @@
 # SPDX-License-Identifier: AGPL-3.0-only
 import asyncio
 import json
-import re #for regex
+import re
 import shutil
+import sqlite3
 import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
 from typing import List, Optional, Tuple
-
-_ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(_ROOT / "backend"))
-sys.path.insert(0, str(_ROOT))
-# editor.py and the schema models it needs import via the package path, so the
-# repo root (the parent of the vynacode package) has to be importable too.
-sys.path.insert(0, str(_ROOT.parent))
 
 import typer
 from rich.console import Console
@@ -23,19 +17,18 @@ from rich.prompt import Confirm
 from rich.text import Text
 from pydantic import BaseModel, ValidationError
 
-from database import (
+from vynacode.backend.database import (
     init_db, upsert_file_metadata, upsert_block, delete_blocks_for_file,
-    write_codebase_json, search_blocks, search_code, get_file_hashes,
-    get_db_paths, index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies,
-    get_unsummarised_files,
+    write_codebase_json, search_blocks, get_file_hashes, get_paths_by_basename,
+    index_stats, prune_deleted_files, ensure_indexed, resolve_all_dependencies,
+    get_unsummarised_files, load_code,
 )
-from walker import walk, compute_sha256
-from parser import parse_file, SUPPORTED_SUFFIXES
-from client import OllamaClient, own_terms
-from summarizer import summarize_and_store
-from schema import DoResponse, FileMetaData, PlanResponse
+from vynacode.backend.walker import walk, compute_sha256
+from vynacode.backend.parser import parse_file, SUPPORTED_SUFFIXES
+from vynacode.backend.client import OllamaClient, own_terms
+from vynacode.backend.summarizer import summarize_and_store
+from vynacode.backend.schema import FileMetaData, PlanResponse, PlanStep, FreeResponse
 from vynacode.backend.editor import AnchorError, apply_action, resolve_span
-from vynacode.backend.schema import FreeResponse
 
 from vynacode.config import (
     CODER_MODEL, PLANNER_MODEL, OLLAMA_URL, TOKEN_BUDGET, TIER,
@@ -59,11 +52,15 @@ RULES = (
 )
 EDIT_HINT = (
     "<edit>\n"
-    "- anchor: first line to replace. end_anchor: last line (omit if one line).\n"
-    "- Copy lines exactly as shown, without the \"  12 | \" gutter.\n"
-    "- If you cannot copy exact text, use the gutter number alone, e.g. \"12\".\n"
-    "- new_text replaces whole lines; keep their indentation.\n"
-    "- If the text repeats, set occurrence (1-based).\n"
+    "- anchor: EXACT line to replace (copy from context, NO line numbers)\n"
+    "- line_count: how many lines from anchor to replace (default 1)\n"
+    "- occurrence: which match if anchor appears multiple times (default 1)\n"
+    "- new_text: replacement lines with correct indentation\n"
+    "\n"
+    "GOOD:  anchor: \"    return a + b\", line_count: 1\n"
+    "GOOD:  anchor: \"def add\", line_count: 2\n"
+    "BAD:   anchor: \"    2 |     return a + b\"  (has gutter)\n"
+    "BAD:   anchor: \"return a+b\"  (whitespace mismatch)\n"
     "</edit>"
 )
 FILE_RULE = (
@@ -79,13 +76,13 @@ FREE_SHAPE = (
     "Return ONLY this JSON. No prose, no markdown fences:\n"
     '{"response": "<one line>", '
     '"edit": {"file_path": "<path relative to repo root>", "anchor": "<line>", '
-    '"end_anchor": "<line>", "occurrence": 1, "new_text": "<lines>"}, '
+    '"line_count": 1, "occurrence": 1, "new_text": "<lines>"}, '
     '"write": {"file_path": "<path relative to repo root>", "content": "<whole file>"}}\n'
     f"{FILE_RULE}"
     "Omit keys you do not use. Never emit a unified diff. response is a string.\n"
     "Example:\n"
-    '{"response": "renamed x to count", "edit": {"file_path": "app/main.py", '
-    '"anchor": "    x = 0", "new_text": "    count = 0"}}\n'
+    '{"response": "changed add to subtract", "edit": {"file_path": "addition.py", '
+    '"anchor": "    return a + b", "line_count": 1, "occurrence": 1, "new_text": "    return a - b"}}\n'
     "</output>"
 )
 
@@ -98,9 +95,6 @@ async def _llm_json_with_retry(
     think: bool | str | None = None,
 ):
     """Call LLM with schema-constrained JSON and retry on validation failure."""
-    # verbose only shows the thinking; it does not enable it.
-    # Falsy caller think wins (never rejected); a settled value beats config and
-    # truthy guesses, since re-sending a rejected form re-probes a known 400.
     if think is None or (think and model in _SETTLED_THINK):
         think = _SETTLED_THINK.get(model, think_for(model))
     if isinstance(think, str) and think.lower() in ("true", "false"):
@@ -182,69 +176,8 @@ def _find_index_root(start: Path) -> Path | None:
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@")
 
 
-def validate_patch(patch: str, root: Path) -> List[str]:
-    """Check a unified diff's hunks against the real file. Empty list = hunks line up."""
-    target = None
-    hunks = []
-    cur = None
-    for line in patch.splitlines():
-        if target is None and line.startswith("+++ "):
-            p = line[4:].strip()
-            target = p[2:] if p.startswith(("a/", "b/")) else p
-            continue
-        m = _HUNK_RE.match(line)
-        if m:
-            cur = (int(m.group(1)), int(m.group(2) or 1), [])
-            hunks.append(cur)
-        elif cur is not None:
-            if line.startswith("\\"):  # "\ No newline at end of file"
-                continue
-            if line.startswith("-"):
-                cur[2].append(line[1:])
-            elif line.startswith(" "):
-                cur[2].append(line[1:])
-
-    if not target:
-        return ["patch has no '+++ b/<path>' target header"]
-    fpath = Path(target)
-    if not fpath.is_absolute():
-        fpath = root / fpath
-    if not fpath.exists():
-        return [f"target file does not exist: {target}"]
-    if not hunks:
-        return [f"{target}: patch contains no @@ hunks"]
-
-    lines = fpath.read_text(encoding="utf-8", errors="replace").splitlines()
-    problems = []
-    for old_start, old_count, old_side in hunks:
-        if old_count != len(old_side):
-            problems.append(
-                f"{target}: @@ -{old_start},{old_count} @@ declares {old_count} old line(s) "
-                f"but the hunk body has {len(old_side)}"
-            )
-        if old_start < 1 or old_start - 1 + len(old_side) > len(lines):
-            problems.append(
-                f"{target}: @@ -{old_start} @@ is outside the file (1..{len(lines)})"
-            )
-            continue
-        actual = lines[old_start - 1: old_start - 1 + len(old_side)]
-        if actual != old_side:
-            for i, (a, b) in enumerate(zip(actual, old_side)):
-                if a != b:
-                    problems.append(
-                        f"{target}: @@ -{old_start} @@ does not match at line {old_start + i} "
-                        f"-- file has {a.strip()!r}, patch expects {b.strip()!r}"
-                    )
-                    break
-    return problems
-
-
 def _proposed_diff(root: Path, response: FreeResponse) -> str:
     """The diff an action would produce, without writing anything.
-
-    apply_action is the only thing that writes, so the preview runs the same
-    resolvers against a throwaway copy in a temp dir instead of a second,
-    possibly divergent, implementation of them.
     """
     action = response.edit or response.write
     with tempfile.TemporaryDirectory() as tmp:
@@ -268,7 +201,7 @@ def _proposed_diff(root: Path, response: FreeResponse) -> str:
             return f"(cannot apply: {e})"
 
 
-def _apply_one(root: Path, label: str, response: FreeResponse) -> bool:
+def _apply_one(root: Path, label: str, response: FreeResponse, auto_yes: bool = False) -> bool:
     """Show the diff, confirm, then apply. False if refused or failed."""
     action = response.edit or response.write
     preview = _proposed_diff(root, response)
@@ -280,13 +213,7 @@ def _apply_one(root: Path, label: str, response: FreeResponse) -> bool:
     console.print(f"\n[bold]{label} {action.file_path}[/bold]")
     console.print(preview)
 
-    # No TTY means no human to answer; declining keeps an unattended run from
-    # writing anything, instead of dying on EOFError mid-pipeline.
-    if not sys.stdin.isatty():
-        console.print("[yellow]Not a terminal: declined automatically.[/yellow]")
-        return False
-
-    if not Confirm.ask("Apply this change?"):
+    if not _confirm("Apply this change?", auto_yes):
         console.print("[yellow]Skipped (not applied).[/yellow]")
         return False
 
@@ -308,33 +235,36 @@ def _apply_one(root: Path, label: str, response: FreeResponse) -> bool:
 
 
 def _rel(root: Path, path: str) -> str:
-    """Path relative to the repo root; a ragged absolute path is a sibling file
-    beyond root in the CWD's tree (temp dirs, siblings) and must be shown in
-    full or the model cannot address it at all."""
     try:
         return str(Path(path).relative_to(root))
     except ValueError:
         return path
 
 
-def _real_lines(db_path: Path, file_path: str, limit: int = 40) -> str:
-    """A file's real numbered lines, from the same FTS store the context came from."""
-    stem = Path(file_path).stem
-    out: List[str] = []
+def _real_lines(db_path: Path, file_path: str, limit: int = 200) -> str:
+    """A file's real numbered lines, read from disk.
+
+    Not from the index: this only runs when an anchor was rejected, so the
+    repair prompt must show what is actually on disk now, not whatever byte
+    slices the FTS happened to rank for the file's stem. A file longer than
+    limit is windowed from the start; the retry only needs the region the
+    model most likely tried to address.
+    """
     root = db_path.parent.parent
-    for b in search_code(db_path, stem):
-        if not b["parent_file"].endswith(file_path):
-            continue
-        if not out:
-            out.append(f"--- File: {_rel(root, b['parent_file'])} ---")
-        for i, line in enumerate(b["code"].splitlines()):
-            out.append(f"{b['line_range_start'] + i:>5} | {line}")
-    return "\n".join(out[:limit])
+    target = root / file_path
+    if not target.is_file():
+        return ""
+    try:
+        lines = target.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return ""
+    out = [f"--- File: {_rel(root, str(target))} ---"]
+    out += [f"{n:>5} | {line}" for n, line in enumerate(lines[:limit], 1)]
+    return "\n".join(out)
 
 
 def _rejected(root: Path, res: FreeResponse) -> Optional[str]:
     """Why apply_action would refuse this response, or None if it would apply."""
-    # Catches both verb mistakes before the user has to decline a bad diff.
     if res.write and (root / res.write.file_path).exists():
         return f"{res.write.file_path} already exists; use edit to change it"
     if not res.edit:
@@ -355,13 +285,11 @@ def _rejected(root: Path, res: FreeResponse) -> Optional[str]:
 async def _correct_file_path(db_path: Path, root: Path, file_path: str) -> Optional[str]:
     """Map a hallucinated path (e.g. app/app.py) onto the unique real file with
     that basename. None when ambiguous, so we never guess against two files."""
-    path = Path(file_path)
     real: Optional[str] = None
-    for b in search_code(db_path, path.stem):
-        p = Path(b['parent_file'])
-        if p.name != path.name or not p.is_file():
+    for p in get_paths_by_basename(db_path, Path(file_path).name):
+        if not Path(p).is_file():
             continue
-        rel = _rel(root, str(p))
+        rel = _rel(root, p)
         if real is not None and real != rel:
             return None
         real = rel
@@ -369,16 +297,14 @@ async def _correct_file_path(db_path: Path, root: Path, file_path: str) -> Optio
 
 
 async def _apply_with_anchor_retry(
-    res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool
+    res: FreeResponse, db_path: Path, root: Path, prompt: str, verbose: bool, auto_yes: bool = False
 ) -> Optional[FreeResponse]:
     """The response that was applied (the retry's, if one replaced it), else None."""
     reason = _rejected(root, res)
     if reason is None:
-        return res if _execute_coder_result(res, root) else None
+        return res if _execute_coder_result(res, root, auto_yes) else None
 
     action = res.write or res.edit
-    # The model can hallucinate a directory in the path (app/app.py after "app"
-    # was a keyword). Retarget onto the real file instead of asking again.
     if action and not (root / action.file_path).exists():
         fixed = _correct_file_path(db_path, root, action.file_path)
         if fixed and fixed != action.file_path:
@@ -388,12 +314,12 @@ async def _apply_with_anchor_retry(
                 res.write.file_path = fixed
             reason = _rejected(root, res)
             if reason is None:
-                return res if _execute_coder_result(res, root) else None
+                return res if _execute_coder_result(res, root, auto_yes) else None
 
     action = res.write or res.edit
     lines = _real_lines(db_path, action.file_path)
     if not lines:
-        return res if _execute_coder_result(res, root) else None
+        return res if _execute_coder_result(res, root, auto_yes) else None
 
     console.print(f"[dim]{reason}; retrying against the file's real lines...[/dim]")
     retry_prompt = prompt + (
@@ -409,7 +335,7 @@ async def _apply_with_anchor_retry(
         CODER_MODEL, retry_prompt, FreeResponse, verbose=verbose,
         think=think_for(CODER_MODEL, "coder"),
     )
-    if again and _execute_coder_result(again, root):
+    if again and _execute_coder_result(again, root, auto_yes):
         return again
     return None
 
@@ -433,16 +359,14 @@ def _refresh_step_files(db_path: Path, res: FreeResponse) -> None:
         upsert_block(db_path, str_path, parse_file(path))
 
 
-def _execute_coder_result(res: FreeResponse, root: Path) -> bool:
+def _execute_coder_result(res: FreeResponse, root: Path, auto_yes: bool = False) -> bool:
     """Apply the coder's actions. False if an action failed."""
     ok = True
     if res.thought:
         console.print(f"\n[bold cyan]Thought:[/bold cyan] {res.thought}")
-    # One action per call: apply_action reads a single edit or write, so passing
-    # both would silently drop one.
-    if res.edit and not _apply_one(root, "edit", FreeResponse(edit=res.edit)):
+    if res.edit and not _apply_one(root, "edit", FreeResponse(edit=res.edit), auto_yes):
         ok = False
-    if res.write and not _apply_one(root, "write", FreeResponse(write=res.write)):
+    if res.write and not _apply_one(root, "write", FreeResponse(write=res.write), auto_yes):
         ok = False
     if res.run:
         for action in res.run:
@@ -460,25 +384,6 @@ def _block_meta(b: dict) -> str:
     return line
 
 _GUTTER_PREFIX = 8  # width of f"{n:>5} | " -> 5 number + 1 space + bar + 1 space
-
-
-def _step_keywords(db_path: Path, step: str) -> Tuple[List[str], List[dict]]:
-    """Keywords from a plan step that retrieve something, most specific first.
-
-    Dynamic by design: every content word is tried (no fixed 4/8-term ceiling), so
-    multi-symbol steps never lose a file to truncation. The token budget then
-    caps how much code each step carries, not how many words were searched.
-    """
-    keywords: List[str] = []
-    blocks: List[dict] = []
-    for w in sorted(own_terms(step), key=lambda t: ("_" in t, len(t)), reverse=True):
-        hits = search_code(db_path, w)
-        if not hits:
-            continue
-        if w not in keywords:
-            keywords.append(w)
-        blocks.extend(hits)
-    return keywords, blocks
 
 
 def _numbered_code(b: dict) -> str:
@@ -520,19 +425,19 @@ def _pack_budget(blocks: List[dict], budget: int) -> List[dict]:
             continue
         packed = [x for j, x in enumerate(packed) if j not in drop]
         packed.append(b)
-        if sum(_estimate_block(x) for x in packed) > budget:
-            # The floor block plus this one still overflows, so the floor block
-            # loses: a lone oversized block is the only state allowed past budget.
+        if est > budget:
+            # Only a lone oversized block may exceed the budget. When the sum is
+            # over only because a no-op eviction freed less than the overflow
+            # (e.g. dropped 56 tok but still 4 tok short), keep the packed
+            # context: a marginal overrun is an estimate error; discarding the
+            # whole context to reset to one small block is not.
             packed = [b]
     return packed
 
 
 def _estimate_block(b: dict) -> int:
-    code = b.get("code") or ""
-    # The join in _numbered_code preserves code's own newlines and only adds
-    # one fixed prefix per line, so this is exact, not a fudge.
-    n_lines = code.count("\n") + 1 if code else 0
-    return (len(code) + n_lines * _GUTTER_PREFIX) // 3
+    n_lines = b['line_range_end'] - b['line_range_start'] + 1
+    return (b['byte_end'] - b['byte_start'] + n_lines * _GUTTER_PREFIX) // 3
 
 
 _RRF_K = 60
@@ -549,19 +454,31 @@ def _fuse(per_keyword: List[Tuple[str, List[dict]]]) -> List[dict]:
             scores[key] = scores.get(key, 0.0) + 1.0 / (_RRF_K + rank)
             if key not in best:
                 best[key] = b
-                if b['name'].lower() == kw.lower():
-                    scores[key] += _EXACT_NAME_BOOST
+            # Outside the first-seen check: a block that first surfaced under a
+            # different keyword must still earn the boost when a later keyword
+            # names it exactly, or RRF keeps the earlier accidental hit on top.
+            if (b.get('name') or '').lower() == kw.lower():
+                scores[key] += _EXACT_NAME_BOOST
     return [best[k] for k in sorted(scores, key=scores.get, reverse=True)]
 
 async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: bool = False):
     console.print("[dim]Retrieving context (code)...[/dim]")
-    fused = _fuse([(kw, search_code(db_path, kw)) for kw in keywords])
+    fused = _fuse([(kw, search_blocks(db_path, kw)) for kw in keywords])
+
+    explicit_files = re.findall(r'(\w+(?:/\w+)*\.\w+)', task)
+    if explicit_files:
+        target = explicit_files[0]
+        before = len(fused)
+        fused = [b for b in fused if target in b['parent_file']]
+        if fused:
+            console.print(f"[cyan]Scoped to {target}: {len(fused)}/{before} blocks[/cyan]")
 
     console.print(f"[cyan]Retrieved {len(fused)} unique blocks from {len(set(b['parent_file'] for b in fused))} files[/cyan]")
 
     selected = _pack_budget(fused, TOKEN_BUDGET)
     if len(selected) < len(fused):
         console.print(f"[yellow]Budget {TOKEN_BUDGET} tok: kept {len(selected)}/{len(fused)} blocks[/yellow]")
+    selected = load_code(db_path, selected, TOKEN_BUDGET)
 
     context_str = ""
     root = db_path.parent.parent
@@ -590,30 +507,28 @@ async def _run_coder(db_path: Path, keywords: List[str], task: str, verbose: boo
     if not res:
         console.print("[red]Coder failed to produce valid JSON[/red]")
         return False
-    return (await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose)) is not None
+    return (await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, prompt, verbose, auto_yes=False)) is not None
 
-async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False) -> bool:
+async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: bool = False, auto_yes: bool = False) -> bool:
     applied_any = False
     root = db_path.parent.parent
-    console.print("[dim]Retrieving context (summaries)...[/dim]")
-    # search_code, not search_blocks: this list is rendered by _block_meta and
-    # _pack_budget, which need deserialised params and the code body. Raw rows
-    # carry params as a JSON string, so rendering one raises TypeError.
-    fused = _fuse([(kw, search_code(db_path, kw)) for kw in keywords])
+    console.print("[dim]Retrieving project map...[/dim]")
+
+    fused = _fuse([(kw, search_blocks(db_path, kw)) for kw in keywords])
 
     console.print(f"[cyan]Retrieved {len(fused)} unique blocks from {len(set(b['parent_file'] for b in fused))} files[/cyan]")
 
-    # Planner sees the real code, not only summaries: with a 16k window the
-    # bodies fit, and body-level tasks (renames, inserts) need the lines to
-    # plan against. Summaries stay for understanding and retrieval, which is
-    # all blocks-without-bodies were ever good for.
-    plan_ctx = ""
-    for b in _pack_budget(fused, TOKEN_BUDGET):
-        plan_ctx += f"--- File: {_rel(root, b['parent_file'])} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
-        plan_ctx += f"{_block_meta(b)}\n"
-        if b.get('summary'):
-            plan_ctx += f"Summary: {b['summary']}\n"
-        plan_ctx += f"Code:\n```\n{_numbered_code(b)}```\n\n"
+    plan_blocks = _pack_budget(fused, TOKEN_BUDGET)
+
+    project_map_lines: List[str] = []
+    seen_files: set = set()
+    for b in plan_blocks:
+        rel = _rel(root, b['parent_file'])
+        summary = b.get('summary') or "(no summary)"
+        project_map_lines.append(f"{rel}: {b['name']} — {summary}")
+        seen_files.add(rel)
+
+    project_map = "\n".join(project_map_lines)
 
     plan_dir = _find_index_root(Path.cwd().resolve())
     plan_path = plan_dir / "last_plan.json" if plan_dir else None
@@ -637,20 +552,19 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
 
     if not plan:
         planner_prompt = (
-            f"<context>\n{plan_ctx}</context>\n\n"
+            f"<project_map>\n{project_map}</project_map>\n\n"
             f"<task>\n{task}\n</task>\n\n"
-"<rules>\n"
-            "- Output an ordered list of steps. Each step changes ONE thing.\n"
-            "- A step is ONE file and ONE symbol. Never bundle two changes in a step.\n"
-            "- Name the exact file path and symbol from the context, verbatim.\n"
+            "<rules>\n"
+            "- Output an ordered list of steps. Each step changes ONE thing in ONE file.\n"
+            "- A step MUST reference a file path and symbol from the project_map verbatim.\n"
             "- Ideal maximum: 8 steps; use fewer for a small task.\n"
-            "- Use only symbols present in the context. Never invent a name.\n"
+            "- Never invent a file path or symbol name not present in the project_map.\n"
             "</rules>\n"
             "<output>\n"
-            'Return ONLY {"steps": ["step", "step"]}. Plain strings, no objects, no code.\n'
+            'Return ONLY {"steps": [{"file": "<path>", "instruction": "<what to change>"}]}.\n'
             "Example:\n"
-            '{"steps": ["In app/main.py, rename x to count in index", '
-            '"In app/main.py, add a log call in save"]}\n'
+            '{"steps": [{"file": "app/main.py", "instruction": "rename x to count in index"}, '
+            '{"file": "app/main.py", "instruction": "add a log call in save"}]}\n'
             "</output>"
         )
 
@@ -659,15 +573,15 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             PLANNER_MODEL, planner_prompt, PlanResponse, verbose=verbose,
             think=think_for(PLANNER_MODEL, "planner"),
         )
-        
+
         if not plan or not plan.steps:
             console.print("[yellow]Planner returned empty steps[/yellow]")
             return False
 
         console.print(f"[green]New Plan ({len(plan.steps)} steps):[/green]")
         for i, step in enumerate(plan.steps, 1):
-            console.print(f"  [cyan]{i}.[/cyan] {step}")
-            
+            console.print(f"  [cyan]{i}.[/cyan] {step.file}: {step.instruction}")
+
         if plan_path:
             try:
                 with plan_path.open("w", encoding="utf-8") as f:
@@ -677,43 +591,34 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             except OSError as e:
                 console.print(f"[red]Error saving plan: {e}[/red]")
 
-        confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with this new plan?")
-        if not confirmation:
+        if not _confirm("Proceed with this new plan?", auto_yes):
             console.print("[yellow]Plan aborted. View it with: [bold]show plan[/bold][/yellow]")
             return False
     else:
         # Plan was loaded
         console.print(f"[green]Loaded Plan ({len(plan.steps)} steps):[/green]")
         for i, step in enumerate(plan.steps, 1):
-            console.print(f"  [cyan]{i}.[/cyan] {step}")
-        
-        confirmation = await asyncio.to_thread(Confirm.ask, "Proceed with loaded plan?")
-        if not confirmation:
+            console.print(f"  [cyan]{i}.[/cyan] {step.file}: {step.instruction}")
+
+        if not _confirm("Proceed with loaded plan?", auto_yes):
             console.print("[yellow]Plan aborted. View it with: [bold]show plan[/bold][/yellow]")
             return False
 
-    # Execution loop
     for i, step in enumerate(plan.steps, 1):
-        console.print(f"\n[dim]Step {i}/{len(plan.steps)}: {step}[/dim]")
-        step_kws, step_blocks = _step_keywords(db_path, step)
-        if not step_blocks:
-            # No keyword matched anything: a fallback of arbitrary blocks would
-            # let the coder fabricate context (it did: it rewrote an unrelated
-            # block). Never edit against invented context.
-            console.print(f"[yellow]Step skipped: no matching code in the index for: {step}[/yellow]")
+        console.print(f"\n[dim]Step {i}/{len(plan.steps)}: {step.file}: {step.instruction}[/dim]")
+
+        resolved = await _resolve_step_file(db_path, root, step.file, step.instruction)
+        if resolved is None:
+            console.print(f"[yellow]Step skipped: cannot resolve file {step.file}[/yellow]")
             continue
-            
-        seen = set()
-        deduped = []
-        for b in step_blocks:
-            key = (b['parent_file'], b['line_range_start'])
-            if key in seen:
-                continue
-            seen.add(key)
-            deduped.append(b)
+
+        step_blocks = await _fetch_file_blocks(db_path, resolved, step.instruction)
+        if not step_blocks:
+            console.print(f"[yellow]Step skipped: no relevant code found in {resolved}[/yellow]")
+            continue
 
         step_context = ""
-        for b in _pack_budget(deduped, TOKEN_BUDGET):
+        for b in step_blocks:
             step_context += f"--- File: {_rel(root, b['parent_file'])} | Range: {b['line_range_start']}-{b['line_range_end']} ---\n"
             step_context += f"{_block_meta(b)}\n"
             if b.get('summary'):
@@ -721,20 +626,10 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
             if b.get('code'):
                 step_context += f"Code:\n```\n{_numbered_code(b)}```\n"
             step_context += "\n"
-        if not step_context.strip():
-            step_context = plan_ctx
-
-        step_files = sorted({b['parent_file'] for b in deduped})
-        scope = ""
-        if step_files:
-            scope += f"Files in context: {', '.join(_rel(root, f) for f in step_files)}\n"
-        if step_kws:
-            scope += f"Keywords: {', '.join(step_kws)}\n"
 
         coder_prompt = (
             f"<context>\n{step_context}</context>\n\n"
-            f"<task>\n{step}\n</task>\n\n"
-            f"{scope}\n"
+            f"<task>\n{step.instruction}\n</task>\n\n"
             f"{RULES}\n"
             f"{EDIT_HINT}\n"
             f"{FREE_SHAPE}"
@@ -745,11 +640,118 @@ async def _run_multi(db_path: Path, keywords: List[str], task: str, verbose: boo
         )
         if not res:
             continue
-        applied = await _apply_with_anchor_retry(res, db_path, db_path.parent.parent, coder_prompt, verbose)
+        applied = await _apply_with_anchor_retry(res, db_path, root, coder_prompt, verbose, auto_yes)
         if applied:
             applied_any = True
             _refresh_step_files(db_path, applied)
+
     return applied_any
+
+
+async def _resolve_step_file(db_path: Path, root: Path, file_path: str, instruction: str = "") -> Optional[str]:
+    """Resolve a step's file path to a real indexed file.
+
+    Order: exact match → basename correction (unique) → smart disambiguation by instruction keywords → None.
+    """
+    candidate = (root / file_path).resolve()
+    if candidate.is_file():
+        return str(candidate)
+
+    fixed = await _correct_file_path(db_path, root, file_path)
+    if fixed:
+        return str((root / fixed).resolve())
+
+    basename = Path(file_path).name
+    candidates = []
+    for p in get_paths_by_basename(db_path, basename):
+        if not Path(p).is_file():
+            continue
+        candidates.append(_rel(root, p))
+
+    if len(candidates) == 1:
+        return str((root / candidates[0]).resolve())
+
+    if candidates and instruction:
+        inst_keywords = set(own_terms(instruction))
+        best_score = -1
+        best = None
+        for cand in candidates:
+            abs_path = str((root / cand).resolve())
+            with sqlite3.connect(str(db_path)) as con:
+                con.row_factory = sqlite3.Row
+                rows = [dict(r) for r in con.execute(
+                    "SELECT name FROM blocks WHERE parent_file = ?", (abs_path,)
+                )]
+            score = sum(
+                1 for r in rows
+                if any(kw.lower() in (r.get('name') or '').lower() for kw in inst_keywords)
+            )
+            if score > best_score:
+                best_score = score
+                best = cand
+        if best:
+            return str((root / best).resolve())
+
+    return None
+
+
+async def _fetch_file_blocks(db_path: Path, file_path: str, instruction: str) -> List[dict]:
+    """Fetch blocks for a single file, prioritized for the instruction.
+
+    Priority:
+    1. Blocks whose name matches instruction keywords (exact or substring)
+    2. Module blocks for the file (always included)
+    3. Dependencies of matched blocks
+
+    All packed to TOKEN_BUDGET.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute(
+            "SELECT * FROM blocks WHERE parent_file = ? ORDER BY line_range_start",
+            (file_path,)
+        )]
+
+    if not rows:
+        return []
+
+    inst_keywords = set(own_terms(instruction))
+
+    matched = []
+    module_blocks = []
+    other = []
+    for b in rows:
+        name = (b.get('name') or '').lower()
+        if b.get('type') == 'module':
+            module_blocks.append(b)
+        elif any(kw.lower() in name or name in kw.lower() for kw in inst_keywords):
+            matched.append(b)
+        else:
+            other.append(b)
+
+    ordered = matched + module_blocks + other
+
+    seen = set()
+    deduped = []
+    for b in ordered:
+        key = (b['line_range_start'], b['line_range_end'])
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(b)
+
+    packed = _pack_budget(deduped, TOKEN_BUDGET)
+    return load_code(db_path, packed, TOKEN_BUDGET)
+
+
+def _confirm(prompt: str, auto_yes: bool) -> bool:
+    """Confirm with TTY guard and --yes support."""
+    if auto_yes:
+        return True
+    if not sys.stdin.isatty():
+        console.print(f"[yellow]Not a terminal: {prompt} -> declined automatically.[/yellow]")
+        return False
+    return Confirm.ask(prompt)
 
 
 def view_plan(path: Path):
@@ -794,7 +796,6 @@ async def _run_index_pipeline(dir_path: Path):
         write_codebase_json(db_path, dir_path / "codebase.json")
 
     await _run_pipeline()
-    # Second pass: cross-block references need every file parsed first.
     resolve_all_dependencies(db_path)
     stale_paths = db_paths - active_paths
     prune_deleted_files(db_path, dir_path / "codebase.json", stale_paths)
@@ -828,8 +829,9 @@ def _record_run(root: Path, task: str, mode: str, applied: bool) -> None:
 @app.command(help="Act on a request: retrieve context, then propose patches and commands.")
 def do(
     message: str = typer.Argument(..., help="Task description in plain English"),
-    mode: str = typer.Option("single", help="single (coder JSON) or multi (planner + coder JSON)"),
+    mode: str = typer.Option("multi", help="single (coder JSON) or multi (planner + coder JSON)"),
     verbose: bool = typer.Option(False, "--verbose", "-v", help="Show the model's <think> blocks"),
+    yes: bool = typer.Option(False, "--yes", "-y", help="Auto-confirm all prompts (non-interactive)"),
 ):
     async def _run_do():
         root = _find_index_root(Path.cwd().resolve())
@@ -857,7 +859,7 @@ def do(
         if mode == "single":
             applied = await _run_coder(db_path, keywords, message, verbose)
         elif mode == "multi":
-            applied = await _run_multi(db_path, keywords, message, verbose)
+            applied = await _run_multi(db_path, keywords, message, verbose, auto_yes=yes)
         else:
             console.print(f"[red]Unknown mode: {mode}. Use 'single' or 'multi'[/red]")
             return

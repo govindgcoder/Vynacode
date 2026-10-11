@@ -15,11 +15,9 @@ def compute_sha256(filepath: Path):
 import os
 
 import pathspec
-from schema import FileMetaData
+from .schema import FileMetaData
 
-# Applied always, whether or not a project defines .vynaignore. Kept in code
-# rather than written to a file so non-interactive runs (CI) get the same sane
-# default; a project-local file only has to add its own exceptions.
+# Applied always, whether or not a project defines .vynaignore.
 BUILTIN_IGNORES = [
     "__pycache__/",
     "*.py[cod]",

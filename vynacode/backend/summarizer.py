@@ -4,9 +4,9 @@ from typing import Dict, List
 
 from pydantic import BaseModel
 
-from schema import Block
-from client import OllamaClient
-from config import PLANNER_MODEL, TOKEN_BUDGET
+from .schema import Block
+from .client import OllamaClient
+from ..config import PLANNER_MODEL, TOKEN_BUDGET
 
 
 class BlockSummaries(BaseModel):

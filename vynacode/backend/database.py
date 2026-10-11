@@ -4,8 +4,16 @@ import re
 from collections import defaultdict
 from pathlib import Path
 from typing import List
-from schema import Block, FileMetaData
-from config import TOKEN_BUDGET
+
+from .schema import Block, FileMetaData
+from ..config import TOKEN_BUDGET
+
+# v1 (implicit): blocks_fts indexed parent_file, so path fragments ("vynacode",
+# "cli") matched every block in the project and drowned precise name/summary
+# hits under RRF. v2 unindexes parent_file; file lookup goes through the files
+# table instead (get_paths_by_basename).
+_SCHEMA_VERSION = 2
+
 
 def init_db(db_path: Path):
     with sqlite3.connect(str(db_path)) as con:
@@ -41,16 +49,46 @@ def init_db(db_path: Path):
     );
 
                     """)
-        con.executescript("""
-                    CREATE VIRTUAL TABLE IF NOT EXISTS blocks_fts USING fts5(
+        if con.execute("PRAGMA user_version").fetchone()[0] < _SCHEMA_VERSION:
+            # Legacy FTS table: drop triggers first so a live blocks write
+            # cannot repopulate the old index mid-rebuild, then rebuild the
+            # postings from blocks itself. blocks is untouched — only the
+            # derived FTS copy changes — so a failed rebuild can be retried
+            # by simply running init_db again.
+            con.executescript("""
+                    DROP TRIGGER IF EXISTS blocks_ai;
+                    DROP TRIGGER IF EXISTS blocks_ad;
+                    DROP TRIGGER IF EXISTS blocks_au;
+                    DROP TABLE IF EXISTS blocks_fts;
+                    CREATE VIRTUAL TABLE blocks_fts USING fts5(
                         id UNINDEXED,
                         name,
                         signature,
                         summary,
-                        parent_file,
+                        parent_file UNINDEXED,
                         content='blocks',
                         content_rowid='rowid'
                     );
+                    CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
+                    END;
+                    CREATE TRIGGER blocks_ad AFTER DELETE ON blocks BEGIN
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                    END;
+                    CREATE TRIGGER blocks_au AFTER UPDATE ON blocks BEGIN
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
+                    END;
+                    INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        SELECT rowid, id, name, signature, summary, parent_file FROM blocks;
+                    """)
+            con.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        else:
+            con.executescript("""
                     CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks BEGIN
                         INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
                         VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
@@ -156,20 +194,14 @@ def resolve_all_dependencies(db_path: Path):
         con.executemany("UPDATE blocks SET dependencies = ? WHERE id = ?", updates)
 
 
-def search_code(db_path: Path, query: str, token_budget: int = TOKEN_BUDGET) -> List[dict]:
-    """Search blocks and retrieve byte-accurate source code within a token budget.
-
-    search_blocks yields BM25 rank order, so exhausting the budget degrades to
-    "the best N matches" rather than an arbitrary subset. The budget is only
-    enforced once one block is in hand, because a caller holding an empty
-    context patches blind.
+def load_code(db_path: Path, blocks: List[dict], budget: int = TOKEN_BUDGET) -> List[dict]:
+    """Materialise source code for already-ranked blocks, plus their dependencies.
     """
-    blocks = search_blocks(db_path, query)
     results = []
     tokens_used = 0
     for block in blocks:
         est_tokens = (block['byte_end'] - block['byte_start']) // 3
-        if results and tokens_used + est_tokens > token_budget:
+        if results and tokens_used + est_tokens > budget:
             break
         result = _block_result(block)
         tokens_used += est_tokens
@@ -192,12 +224,28 @@ def search_code(db_path: Path, query: str, token_budget: int = TOKEN_BUDGET) -> 
             if row['id'] in have:
                 continue
             est_tokens = (row['byte_end'] - row['byte_start']) // 3
-            if results and tokens_used + est_tokens > token_budget:
+            if results and tokens_used + est_tokens > budget:
                 break
             result = _block_result(row)
             tokens_used += est_tokens
             results.append(result)
     return results
+
+def get_paths_by_basename(db_path: Path, basename: str) -> List[str]:
+    """All indexed file paths whose final component is basename.
+
+    Path retargeting: the model invents a directory (app/app.py for app.py),
+    and the files table holds the real absolute paths. FTS cannot serve this
+    once parent_file is UNINDEXED, and LIKE on the files table is exact enough
+    because the basename is anchored after the last slash.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT path FROM files WHERE path LIKE ? ESCAPE '\\'",
+            ("%" + "/" + basename.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"),),
+        ).fetchall()
+    return [row[0] for row in rows]
+
 
 def upsert_file_metadata(db_path: Path, metadata: FileMetaData):
     with sqlite3.connect(str(db_path)) as con:
@@ -262,11 +310,6 @@ def write_codebase_json(db_path: Path, codebase_json: Path):
             })
         with open(codebase_json, "w", encoding="utf-8") as f:
             json.dump(codebase_data, f, indent=4, ensure_ascii=False)
-
-def get_db_paths(db_path: Path):
-    with sqlite3.connect(str(db_path)) as con:
-        rows = con.execute("SELECT path FROM files").fetchall()
-    return {row[0] for row in rows} if rows else set()
 
 def get_file_hashes(db_path: Path) -> dict[str, str]:
     """Return mapping path -> hash for incremental skip."""

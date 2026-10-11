@@ -2,7 +2,7 @@ import json
 import re
 from typing import List
 
-from schema import ExpandQueryResponse
+from .schema import ExpandQueryResponse
 
 _STOPWORDS = frozenset(
     "a an and are as at be but by for from has have if in into is it its of on "
@@ -34,7 +34,7 @@ def own_terms(text: str) -> List[str]:
 
 import httpx
 
-from config import CONTEXT_WINDOW, RESERVED_OUTPUT_TOKENS
+from ..config import CONTEXT_WINDOW, RESERVED_OUTPUT_TOKENS
 
 
 def _as_think(think: bool | str) -> bool | str:
@@ -126,33 +126,8 @@ class OllamaClient:
         message = await self._chat(model, role, prompt, think, format)
         return message.get("content", ""), message.get("thinking", "") or ""
 
-    async def stream(self, model: str, role: str, prompt: str, think: bool | str = False, format=None):
-        payload = {
-            "model": model,
-            "messages": [{"role": role, "content": prompt}],
-            "stream": True,
-            "think": _as_think(think),
-            "options": {
-                "num_predict": _output_budget(prompt, think),
-                "num_ctx": CONTEXT_WINDOW,
-            },
-        }
-        if format is not None:
-            payload["format"] = format
-        async with self._client.stream(
-            "POST", f"{self.base_url}/api/chat", json=payload
-        ) as response:
-            response.raise_for_status()
-            async for line in response.aiter_lines():
-                if line.strip():
-                    try:
-                        data = json.loads(line)
-                        yield data["message"]["content"]
-                    except json.JSONDecodeError:
-                        continue
-
     async def __aenter__(self):
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(self, *args):
         await self._client.aclose()

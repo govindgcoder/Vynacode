@@ -224,3 +224,42 @@ def test_render_diff_accepts_lines_without_newlines():
 
 def test_take_snapshot_does_not_double_newlines():
     assert take_snapshot(["a\n", "b\n"]) == b"a\nb\n"
+
+
+# --- line_count and occurrence (new anchor format) -------------------------
+
+def test_resolve_span_line_count_single():
+    lines = ["def foo():\n", "    return 1\n", "    return 2\n"]
+    assert resolve_span(lines, "    return 1", line_count=1) == (2, 2)
+
+
+def test_resolve_span_line_count_multi():
+    lines = ["def foo():\n", "    return 1\n", "    return 2\n"]
+    assert resolve_span(lines, "    return 1", line_count=2) == (2, 3)
+
+
+def test_resolve_span_occurrence():
+    lines = ["x = 1\n", "x = 2\n", "x = 3\n"]
+    assert resolve_span(lines, "x =", occurrence=1) == (1, 1)
+    assert resolve_span(lines, "x =", occurrence=2) == (2, 2)
+    assert resolve_span(lines, "x =", occurrence=3) == (3, 3)
+
+
+def test_resolve_span_occurrence_out_of_range():
+    lines = ["x = 1\n", "x = 2\n"]
+    with pytest.raises(Ambiguous):
+        resolve_span(lines, "x =", occurrence=3)
+
+
+def test_resolve_span_fallback_end_anchor():
+    lines = ["def foo():\n", "    return 1\n", "    return 2\n"]
+    # Old-style call with end_anchor still works
+    assert resolve_span(lines, "def foo():", "    return 2") == (1, 3)
+    # Explicit end_anchor with line_count=1
+    assert resolve_span(lines, "def foo():", end_anchor="    return 2") == (1, 3)
+
+
+def test_resolve_span_line_count_preferred_over_end_anchor():
+    lines = ["def foo():\n", "    return 1\n", "    return 2\n"]
+    # line_count > 1 takes precedence over end_anchor
+    assert resolve_span(lines, "def foo():", line_count=2, end_anchor="    return 2") == (1, 2)

@@ -12,7 +12,7 @@ import tree_sitter_python as tspython
 import tree_sitter_rust as tsrust
 import tree_sitter_swift as tsswift
 import tree_sitter_typescript as tstypescript
-from schema import Block
+from .schema import Block
 from tree_sitter import Language, Parser, Query, QueryCursor
 
 
@@ -119,6 +119,84 @@ PARSER = Parser()
 # and generic Rust headers useful without letting one block eat the budget.
 _SIG_MAX = 200
 
+# Synthetic module blocks cap: imports and module constants are short; a wall
+# of them still must not become one block that owns the token budget.
+_MODULE_CHUNK_LINES = 60
+
+
+def _module_blocks(filepath: Path, source: bytes, definitions: List[Block]) -> List[Block]:
+    """Synthetic blocks for the line spans no definition covers.
+
+    Imports, module constants and prompt strings match no tree-sitter
+    definition query, so without these the lines holding e.g.
+    MAX_RETRIES = 3 are invisible to FTS, to summaries and to the anchor
+    editor — the exact failure that made "change MAX_RETRIES" edits
+    impossible to retrieve. Nested definitions (methods inside a class)
+    overlap their parent; the merged coverage union absorbs them.
+    """
+    if not source:
+        return []
+    covered = sorted((b.line_range for b in definitions))
+    merged: List[tuple[int, int]] = []
+    for start, end in covered:
+        if merged and start <= merged[-1][1] + 1:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+        else:
+            merged.append((start, end))
+
+    # 1-indexed line starts; a trailing newline appends a phantom start at
+    # EOF that is not a real line, dropped by the endswith check below.
+    line_starts = [0, 0]
+    for i, byte in enumerate(source):
+        if byte == 0x0A:
+            line_starts.append(i + 1)
+    total_lines = len(line_starts) - 1 - (1 if source.endswith(b"\n") else 0)
+
+    gaps: List[tuple[int, int]] = []
+    cursor = 1
+    for start, end in merged:
+        if start > cursor:
+            gaps.append((cursor, start - 1))
+        cursor = max(cursor, end + 1)
+    if cursor <= total_lines:
+        gaps.append((cursor, total_lines))
+
+    blocks: List[Block] = []
+    for gap_start, gap_end in gaps:
+        chunk_start = gap_start
+        while chunk_start <= gap_end:
+            chunk_end = min(chunk_start + _MODULE_CHUNK_LINES - 1, gap_end)
+            byte_start = line_starts[chunk_start]
+            byte_end = (line_starts[chunk_end + 1]
+                        if chunk_end + 1 < len(line_starts) else len(source))
+            text = source[byte_start:byte_end]
+            if not text.strip():
+                # A gap of pure whitespace separates definitions; indexing it
+                # would only add empty blocks to FTS.
+                chunk_start = chunk_end + 1
+                continue
+            header = next(
+                (ln.strip() for ln in text.splitlines() if ln.strip()), ""
+            )
+            id_val = hashlib.sha256(
+                f"{filepath}:module:{chunk_start}".encode()
+            ).hexdigest()
+            blocks.append(
+                Block(
+                    id=id_val,
+                    name=filepath.stem,
+                    type="module",
+                    signature=header[:_SIG_MAX],
+                    line_range=(chunk_start, chunk_end),
+                    byte_start=byte_start,
+                    byte_end=byte_end,
+                    parent_id=None,
+                    parent_file=str(filepath),
+                )
+            )
+            chunk_start = chunk_end + 1
+    return blocks
+
 
 def _signature(node, source: bytes) -> str:
     """The definition's header text, from its first byte up to its body.
@@ -179,5 +257,7 @@ def parse_file(filepath: Path) -> List[Block]:
             )
     # Captures arrive grouped by tag; byte order is what the prompt and anchor
     # logic assume, so restore it.
+    block_list.sort(key=lambda b: b.byte_start)
+    block_list.extend(_module_blocks(filepath, source, block_list))
     block_list.sort(key=lambda b: b.byte_start)
     return block_list

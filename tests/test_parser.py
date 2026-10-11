@@ -5,11 +5,10 @@ from pathlib import Path
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
-# The backend modules import each other bare (e.g. `from schema import Block`),
-# exactly as cli.py arranges, so the backend dir must be importable.
-sys.path.insert(0, str(ROOT / "vynacode" / "backend"))
+# Add the repo root so vynacode package is importable
+sys.path.insert(0, str(ROOT))
 
-from parser import SUPPORTED_SUFFIXES, parse_file  # noqa: E402
+from vynacode.backend.parser import SUPPORTED_SUFFIXES, parse_file
 
 
 def _blocks(tmp_path: Path, name: str, source: str):
@@ -64,6 +63,8 @@ def test_tsx_uses_tsx_grammar(tmp_path):
 
 def test_go_blocks(tmp_path):
     assert _shape(_blocks(tmp_path, "m.go", GO)) == [
+        # `package p` matches no definition query; the module block covers it.
+        ("m", "module", (1, 1)),
         ("Foo", "function", (2, 2)),
         ("Bar", "method", (3, 2 + 1)),
         ("S", "class", (4, 4)),

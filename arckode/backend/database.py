@@ -1,0 +1,374 @@
+import sqlite3
+import json
+import re
+from collections import defaultdict
+from pathlib import Path
+from typing import List
+
+from .schema import Block, FileMetaData
+from ..config import TOKEN_BUDGET
+
+# v1 (implicit): blocks_fts indexed parent_file, so path fragments ("arckode",
+# "cli") matched every block in the project and drowned precise name/summary
+# hits under RRF. v2 unindexes parent_file; file lookup goes through the files
+# table instead (get_paths_by_basename).
+_SCHEMA_VERSION = 2
+
+
+def init_db(db_path: Path):
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+        con.execute(
+            (
+                """CREATE TABLE IF NOT EXISTS files (
+        name TEXT,
+        path TEXT PRIMARY KEY,
+        language TEXT,
+        size_bytes INTEGER,
+        hash TEXT,
+        imports JSON
+        )"""
+            )
+        )
+        con.execute("""
+                    CREATE TABLE IF NOT EXISTS blocks (
+    id TEXT PRIMARY KEY,
+    name TEXT,
+    type TEXT,
+    signature TEXT,
+    line_range_start INTEGER,
+    line_range_end INTEGER,
+    dependencies TEXT,
+    summary TEXT,
+    byte_start INTEGER NOT NULL,
+    byte_end INTEGER NOT NULL,
+    parent_id TEXT,
+    parent_file TEXT,
+    chunk_boundary INTEGER NOT NULL DEFAULT 0, 
+    FOREIGN KEY (parent_file) REFERENCES files (path) ON  DELETE CASCADE
+    );
+
+                    """)
+        if con.execute("PRAGMA user_version").fetchone()[0] < _SCHEMA_VERSION:
+            # Legacy FTS table: drop triggers first so a live blocks write
+            # cannot repopulate the old index mid-rebuild, then rebuild the
+            # postings from blocks itself. blocks is untouched — only the
+            # derived FTS copy changes — so a failed rebuild can be retried
+            # by simply running init_db again.
+            con.executescript("""
+                    DROP TRIGGER IF EXISTS blocks_ai;
+                    DROP TRIGGER IF EXISTS blocks_ad;
+                    DROP TRIGGER IF EXISTS blocks_au;
+                    DROP TABLE IF EXISTS blocks_fts;
+                    CREATE VIRTUAL TABLE blocks_fts USING fts5(
+                        id UNINDEXED,
+                        name,
+                        signature,
+                        summary,
+                        parent_file UNINDEXED,
+                        content='blocks',
+                        content_rowid='rowid'
+                    );
+                    CREATE TRIGGER blocks_ai AFTER INSERT ON blocks BEGIN
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
+                    END;
+                    CREATE TRIGGER blocks_ad AFTER DELETE ON blocks BEGIN
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                    END;
+                    CREATE TRIGGER blocks_au AFTER UPDATE ON blocks BEGIN
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
+                    END;
+                    INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        SELECT rowid, id, name, signature, summary, parent_file FROM blocks;
+                    """)
+            con.execute(f"PRAGMA user_version = {_SCHEMA_VERSION}")
+        else:
+            con.executescript("""
+                    CREATE TRIGGER IF NOT EXISTS blocks_ai AFTER INSERT ON blocks BEGIN
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS blocks_ad AFTER DELETE ON blocks BEGIN
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                    END;
+                    CREATE TRIGGER IF NOT EXISTS blocks_au AFTER UPDATE ON blocks BEGIN
+                        INSERT INTO blocks_fts (blocks_fts, rowid, id, name, signature, summary, parent_file)
+                        VALUES ('delete', old.rowid, old.id, old.name, old.signature, old.summary, old.parent_file);
+                        INSERT INTO blocks_fts (rowid, id, name, signature, summary, parent_file)
+                        VALUES (new.rowid, new.id, new.name, new.signature, new.summary, new.parent_file);
+                    END;
+                    """)
+
+def _fts_term(query: str) -> str:
+    """Quote a raw term as a single FTS5 token, with prefix matching enabled.
+
+    FTS5 treats . + ` ( ) * and - as query syntax, so an unquoted keyword such
+    as `user.id` or `C++` raises OperationalError instead of returning nothing.
+    Doubling embedded quotes is required: a bare `a"b` is an unterminated
+    string. The trailing * is prefix search, kept outside the closing quote so
+    it is a prefix query rather than part of the phrase.
+    """
+    query = query.strip()
+    if not query:
+        return ""
+    return '"' + query.replace('"', '""') + '"*'
+
+
+def search_blocks(db_path: Path, query: str) -> List[dict]:
+    """Search blocks using FTS5 with BM25 scoring."""
+    term = _fts_term(query)
+    if not term:
+        return []
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        cursor = con.execute(
+            """
+            SELECT b.*
+            FROM blocks b
+            JOIN blocks_fts f ON b.id = f.id
+            WHERE blocks_fts MATCH ?
+            ORDER BY bm25(blocks_fts)
+            """,
+            (term,)
+        )
+        return [dict(row) for row in cursor.fetchall()]
+
+
+def _block_result(block: dict) -> dict:
+    """Read a block's byte range and return every metadata field plus its code."""
+    try:
+        with open(block['parent_file'], 'rb') as f:
+            f.seek(block['byte_start'])
+            code = f.read(block['byte_end'] - block['byte_start']).decode('utf-8', errors='replace')
+    except OSError:
+        code = ''
+    return {
+        **block,
+        'dependencies': json.loads(block['dependencies']) if block['dependencies'] else [],
+        'code': code,
+        'token_estimate': (block['byte_end'] - block['byte_start']) // 3,
+    }
+
+
+def resolve_all_dependencies(db_path: Path):
+    """Fill blocks.dependencies with the other block names each block references.
+
+    Runs as a second pass over the finished index so resolution is
+    order-independent: a block indexed first must still see blocks from files
+    parsed later. Records direct references only, so nothing here implies a
+    transitive walk.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        con.row_factory = sqlite3.Row
+        rows = [dict(r) for r in con.execute(
+            "SELECT id, name, parent_file, byte_start, byte_end FROM blocks")]
+        names = {r['name'] for r in rows}
+        by_file = defaultdict(list)
+        for r in rows:
+            by_file[r['parent_file']].append(r)
+
+        updates = []
+        for r in rows:
+            try:
+                with open(r['parent_file'], 'rb') as f:
+                    f.seek(r['byte_start'])
+                    src = f.read(r['byte_end'] - r['byte_start']).decode('utf-8', errors='replace')
+            except OSError:
+                continue
+            # \b keeps a block named `run` from matching inside `runner`.
+            found = (names & set(re.findall(r"\b\w+\b", src))) - {r['name']}
+            # A block nested inside this one (a class naming its own methods) is
+            # already present in its code, so counting it as a dependency would
+            # re-send code the caller already has.
+            found -= {
+                o['name'] for o in by_file[r['parent_file']]
+                if o['name'] != r['name'] and r['byte_start'] <= o['byte_start'] < r['byte_end']
+            }
+            updates.append((json.dumps(sorted(found)), r['id']))
+        con.executemany("UPDATE blocks SET dependencies = ? WHERE id = ?", updates)
+
+
+def load_code(db_path: Path, blocks: List[dict], budget: int = TOKEN_BUDGET) -> List[dict]:
+    """Materialise source code for already-ranked blocks, plus their dependencies.
+    """
+    results = []
+    tokens_used = 0
+    for block in blocks:
+        est_tokens = (block['byte_end'] - block['byte_start']) // 3
+        if results and tokens_used + est_tokens > budget:
+            break
+        result = _block_result(block)
+        tokens_used += est_tokens
+        results.append(result)
+
+    have = {r['id'] for r in results}
+    dep_names = []
+    for r in results:
+        for name in r['dependencies']:
+            if name not in have:
+                have.add(name)
+                dep_names.append(name)
+    if dep_names:
+        marks = ",".join("?" * len(dep_names))
+        with sqlite3.connect(str(db_path)) as con:
+            con.row_factory = sqlite3.Row
+            dep_rows = [dict(x) for x in con.execute(
+                f"SELECT * FROM blocks WHERE name IN ({marks})", dep_names)]
+        for row in dep_rows:
+            if row['id'] in have:
+                continue
+            est_tokens = (row['byte_end'] - row['byte_start']) // 3
+            if results and tokens_used + est_tokens > budget:
+                break
+            result = _block_result(row)
+            tokens_used += est_tokens
+            results.append(result)
+    return results
+
+def get_paths_by_basename(db_path: Path, basename: str) -> List[str]:
+    """All indexed file paths whose final component is basename.
+
+    Path retargeting: the model invents a directory (app/app.py for app.py),
+    and the files table holds the real absolute paths. FTS cannot serve this
+    once parent_file is UNINDEXED, and LIKE on the files table is exact enough
+    because the basename is anchored after the last slash.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT path FROM files WHERE path LIKE ? ESCAPE '\\'",
+            ("%" + "/" + basename.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_"),),
+        ).fetchall()
+    return [row[0] for row in rows]
+
+
+def upsert_file_metadata(db_path: Path, metadata: FileMetaData):
+    with sqlite3.connect(str(db_path)) as con:
+        # Per-connection and OFF by default in SQLite. init_db sets it, but the
+        # pragma is not inherited, so every connection that writes must re-enable
+        # it or blocks can be inserted against a files row that does not exist.
+        con.execute("PRAGMA foreign_keys = ON;")
+        con.execute(
+            "INSERT INTO files (path, hash, language, size_bytes) VALUES (?, ?, ?, ?) "
+            "ON CONFLICT(path) DO UPDATE SET hash = excluded.hash, language = excluded.language, size_bytes = excluded.size_bytes",
+            (str(metadata.path), metadata.hash, metadata.language, metadata.size_bytes),
+        )
+
+def delete_blocks_for_file(db_path: Path, parent_file: str):
+    """Remove stale blocks for a file before re-inserting updated ones."""
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+        con.execute("DELETE FROM blocks WHERE parent_file = ?", (parent_file,))
+
+def upsert_block(db_path: Path, parent_file: str, blocks: List[Block]):
+    with sqlite3.connect(str(db_path)) as con:
+        # Load-bearing: blocks.parent_file references files(path) ON DELETE CASCADE.
+        # Without this the FK is unenforced, which is how orphaned blocks for
+        # deleted files accumulated. upsert_file_metadata must run first.
+        con.execute("PRAGMA foreign_keys = ON;")
+        for block in blocks:
+            deps_json = json.dumps(block.dependencies if block.dependencies else [])
+            con.execute(
+                """INSERT INTO blocks (id, name, type, signature, line_range_start, line_range_end, dependencies, summary, byte_start, byte_end, parent_id, parent_file, chunk_boundary)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(id) DO UPDATE SET
+                       name=excluded.name,
+                       type=excluded.type,
+                       signature=excluded.signature,
+                       line_range_start=excluded.line_range_start,
+                       line_range_end=excluded.line_range_end,
+                       dependencies=excluded.dependencies,
+                       summary=excluded.summary,
+                       byte_start=excluded.byte_start,
+                       byte_end=excluded.byte_end,
+                       parent_id=excluded.parent_id,
+                       parent_file=excluded.parent_file,
+                       chunk_boundary=excluded.chunk_boundary""",
+                (block.id, block.name, block.type, block.signature, block.line_range[0], block.line_range[1], deps_json, block.summary, block.byte_start, block.byte_end, block.parent_id, block.parent_file, block.chunk_boundary),
+            )
+
+def write_codebase_json(db_path: Path, codebase_json: Path):
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT files.path, blocks.name, blocks.summary, blocks.line_range_start, blocks.line_range_end "
+            "FROM files "
+            "INNER JOIN blocks ON files.path = blocks.parent_file "
+            "ORDER BY files.path, blocks.line_range_start"
+        ).fetchall()
+        codebase_data = defaultdict(list)
+        for file_path, block_name, summary, line_range_start, line_range_end in rows:
+            codebase_data[file_path].append({
+                "name": block_name,
+                "line_start": line_range_start,
+                "line_end": line_range_end,
+                "summary": summary
+            })
+        with open(codebase_json, "w", encoding="utf-8") as f:
+            json.dump(codebase_data, f, indent=4, ensure_ascii=False)
+
+def get_file_hashes(db_path: Path) -> dict[str, str]:
+    """Return mapping path -> hash for incremental skip."""
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute("SELECT path, hash FROM files").fetchall()
+    return {row[0]: row[1] for row in rows} if rows else {}
+
+
+def get_unsummarised_files(db_path: Path) -> set[str]:
+    """Files holding at least one block with no summary.
+
+    An unchanged file is skipped by the incremental pass, so a block whose
+    summary failed to generate would otherwise stay empty forever.
+    """
+    with sqlite3.connect(str(db_path)) as con:
+        rows = con.execute(
+            "SELECT DISTINCT parent_file FROM blocks WHERE summary IS NULL OR summary = ''"
+        ).fetchall()
+    return {row[0] for row in rows if row[0]}
+
+
+def index_stats(db_path: Path) -> dict:
+    """Counts for `arckode status`: files, blocks and how many have summaries."""
+    with sqlite3.connect(str(db_path)) as con:
+        files = con.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+        blocks, summarised = con.execute(
+            "SELECT COUNT(*), SUM(summary IS NOT NULL AND summary != '') FROM blocks"
+        ).fetchone()
+    return {"files": files, "blocks": blocks, "summarised": summarised or 0}
+
+
+def ensure_indexed(db_path: Path) -> bool:
+    """Check if the index exists."""
+    return db_path.exists()
+
+def prune_deleted_files(db_path: Path, codebase_json: Path, stale_paths):
+    if not stale_paths:
+        return
+    with sqlite3.connect(str(db_path)) as con:
+        con.execute("PRAGMA foreign_keys = ON;")
+        for p in stale_paths:
+            con.execute("DELETE FROM files WHERE path=?", (str(p),))
+        con.commit()
+
+    try:
+        with open(codebase_json, "r", encoding="utf-8") as f:
+            codebase_data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError):
+        return
+
+    changed = False
+    for p in stale_paths:
+        # JSON keys are stored as strings; pop both str and original form
+        if codebase_data.pop(str(p), None) is not None:
+            changed = True
+
+    if changed:
+        with open(codebase_json, "w", encoding="utf-8") as f:
+            json.dump(codebase_data, f, indent=4, ensure_ascii=False)
+
+    print(f"Pruned {len(stale_paths)} path(s): {sorted(str(p) for p in stale_paths)}")
+

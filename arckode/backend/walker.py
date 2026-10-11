@@ -15,13 +15,23 @@ def compute_sha256(filepath: Path):
 import os
 
 import pathspec
-from schema import FileMetaData
+from .schema import FileMetaData
+
+# Applied always, whether or not a project defines .arkignore.
+BUILTIN_IGNORES = [
+    "__pycache__/",
+    "*.py[cod]",
+    ".venv/",
+    "build/",
+    "dist/",
+    ".arkrc",
+    ".python-version",
+]
 
 
 def build_pathspec(base: Path):
-    files = [".gitignore", ".vynaignore"]
-    lines = [".git/", ".vc/", "codebase.json", "codebase.md"]
-    for file in files:
+    lines = [".git/", ".vc/", "codebase.json", "codebase.md", *BUILTIN_IGNORES]
+    for file in (".gitignore", ".arkignore"):
         path = base / file
         try:
             with open(path, "r") as f:

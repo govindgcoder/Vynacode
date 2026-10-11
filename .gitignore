@@ -10,3 +10,5 @@ dist/
 .python-version
 
 codebase.json
+.vc/
+last_plan.json

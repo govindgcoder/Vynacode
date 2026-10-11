@@ -1,19 +1,24 @@
 [project]
-name = "vynacode"
+name = "arckode"
 version = "0.1.0"
-description = "Vynacode weaves together your codebase and local AI models at compact VRAM constraints."
+description = "arcKode weaves together your codebase and local AI models at compact VRAM constraints."
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
-    "asyncio>=4.0.0",
     "typer>=0.12.0",
-    "ollama>=0.6.2",
-    "requests>=2.34.2",
     "tree-sitter>=0.26.0",
     "tree-sitter-python>=0.25.0",
     "pydantic>=2.0.0",
     "httpx>=0.27.0",
     "pathspec>=0.12.0",
+    "tree-sitter-javascript>=0.25.0",
+    "tree-sitter-typescript>=0.23.0",
+    "tree-sitter-go>=0.25.0",
+    "tree-sitter-rust>=0.24.0",
+    "tree-sitter-java>=0.23.0",
+    "tree-sitter-c-sharp>=0.23.5",
+    "tree-sitter-kotlin>=1.1.0",
+    "tree-sitter-swift>=0.7.4",
 ]
 
 [build-system]
@@ -26,7 +31,7 @@ dev = [
 ]
 
 [project.scripts]
-vynacode = "vynacode.cli:app"
+arckode = "arckode.cli:app"
 
 [project.license]
 text = "AGPL-3.0-only"

@@ -195,6 +195,3 @@ Configuration file locations (precedence order):
 
 AGPL-3.0-only: see [LICENSE](https://www.google.com/search?q=LICENSE) for details.
 
-```
-
-```

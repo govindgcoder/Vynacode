@@ -60,8 +60,9 @@ def test_noop_eviction_keeps_packed_context():
 def test_oversized_block_stands_alone():
     big = _block(2049, "huge")
     small = _block(50, "tiny", line=5)
+    # First block (small) fits; second block (big) exceeds budget and is skipped.
     packed = _pack_budget([small, big], budget=2048)
-    assert packed == [big]
+    assert packed == [small]
 
 
 def test_estimate_uses_bytes_not_code():

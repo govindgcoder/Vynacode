@@ -403,6 +403,10 @@ def _pack_budget(blocks: List[dict], budget: int) -> List[dict]:
         if not packed:
             packed.append(b)
             continue
+        # Non-first block exceeding total budget can never fit alongside others;
+        # skip it to preserve higher-ranked blocks.
+        if est > budget:
+            continue
         # Recomputed rather than incremented, because a block admitted as the
         # oversized floor earlier may have been displaced since.
         used = sum(_estimate_block(x) for x in packed)
@@ -425,13 +429,6 @@ def _pack_budget(blocks: List[dict], budget: int) -> List[dict]:
             continue
         packed = [x for j, x in enumerate(packed) if j not in drop]
         packed.append(b)
-        if est > budget:
-            # Only a lone oversized block may exceed the budget. When the sum is
-            # over only because a no-op eviction freed less than the overflow
-            # (e.g. dropped 56 tok but still 4 tok short), keep the packed
-            # context: a marginal overrun is an estimate error; discarding the
-            # whole context to reset to one small block is not.
-            packed = [b]
     return packed
 
 
